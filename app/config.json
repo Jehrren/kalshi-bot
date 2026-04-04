@@ -58,6 +58,18 @@
             "action": { "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1 }
         },
         {
+            "name": "Time Decay – Überschätztes YES mit langer Laufzeit → NO",
+            "description": "Märkte mit 14+ Tagen Restlaufzeit und YES 18–62¢ verfallen tägl. ~0.2% wenn das Ereignis ausbleibt. Edge aus Strategy-6-Backtest: Zeit arbeitet systematisch gegen YES-Halter bei seltenen Ereignissen.",
+            "enabled": true,
+            "condition": {
+                "type": "time_decay_no",
+                "min_days_remaining": 14,
+                "yes_ask_min": 18,
+                "yes_ask_max": 62
+            },
+            "action": { "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1 }
+        },
+        {
             "name": "Gut kalibrierte Zone (73–82%) → YES kaufen",
             "description": "Beste Kalibrierung laut Daten. Trend folgen.",
             "enabled": true,

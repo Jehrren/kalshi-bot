@@ -15,6 +15,7 @@ Bedingungstypen:
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -257,6 +258,22 @@ class RuleEngine:
                     matched = True
                     reason  = f"BTC {change:.2f}% / UP={yes_ask}¢ ≤ {100-bias_thr}¢ → UP fade"
                     side, action = "yes", "buy"
+
+        elif t == "time_decay_no":
+            min_days = float(cond.get("min_days_remaining", 14))
+            ask_min  = int(cond.get("yes_ask_min", 18))
+            ask_max  = int(cond.get("yes_ask_max", 62))
+            ct_str   = market.get("close_time", "")
+            if yes_ask is not None and ask_min <= yes_ask <= ask_max and ct_str:
+                try:
+                    ct   = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                    days = (ct - datetime.now(timezone.utc)).days
+                    if days >= min_days:
+                        matched = True
+                        reason  = f"Time-Decay: YES={yes_ask}¢ | {days}d verbleibend → tägl. Verfall"
+                        side, action = "no", "buy"
+                except Exception:
+                    pass
 
         elif t == "spread_wide":
             thr = int(cond.get("threshold", 5))

@@ -8,7 +8,7 @@ Inklusive **Live-Dashboard** (React + Node.js) für Positionen, Settlements und 
 
 ## Features
 
-- **3 unabhängige Trading-Tracks** mit eigenen Regelwerken
+- **3 Trading-Tracks + Ladder-Arbitrage** mit eigenen Regelwerken
 - **Multi-Asset BingX Feed** für technische Indikatoren (BTC, ETH, SOL, XRP, DOGE, BNB, HYPE, SHIB)
 - **Kalshi WebSocket** für Echtzeit-Preise bei 15-Min-Fenstern
 - **Dry-Run-Modus** mit persistenten In-Memory-Positionen
@@ -30,14 +30,17 @@ Kalshi-Märkte sind systematisch zu optimistisch bei YES-Chancen. Das erzeugt st
 | YES-Ask **55–65 ¢** | ~1–2 % Überschätzung | NO kaufen (klein) |
 | YES-Ask **73–82 ¢** | Beste Kalibrierung, kaum Bias | YES kaufen |
 | YES-Ask **> 90 ¢** | ~5 % Overconfidence-Bias | NO kaufen (groß) |
+| YES **18–62 ¢** + **≥ 14 Tage** Restlaufzeit | Zeit-Verfall: ohne Ereignis fällt Preis tägl. ~0,2 % | NO kaufen |
 
 ### Track 1 – Politische & Wirtschaftliche Märkte
 
 Scannt alle Kategorien (Economics, Politics, Financials, Health, Science usw.) nach Märkten mit Laufzeit ≤ 30 Tage, filtert nach Mindestvolumen und Open Interest, wendet die Kalibrierungsregeln an.
 
-### Track 2 – Crypto Preis-Leiter
+### Track 2 – Crypto Preis-Leiter + Ladder Arbitrage
 
 Entdeckt Crypto-Preisstufen-Märkte dynamisch via Kalshi Events-API (KXBTC, KXETH, KXSOL usw.). Kombiniert Kalibrierungsregeln mit BingX-Indikatoren (RSI, EMA, Distanz zur Schwelle). Kelly-Sizing mit Quarter-Kelly.
+
+**Ladder Arbitrage (Track 2b):** Prüft mathematische Konsistenz zwischen benachbarten Preisstufen aller Tages-Serien (KXBTCD, KXETHD, KXSOLD, KXXRPD, KXDOGED, KXBNBD). P(Asset > $X) ≥ P(Asset > $Y) muss immer gelten wenn X < Y. Verletzung = risikofreier Gewinn in jedem Szenario → automatisches Hedging beider Legs.
 
 ### Track 3 – BTC 15-Min Mean Reversion
 

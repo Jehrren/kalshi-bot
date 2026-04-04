@@ -74,8 +74,8 @@ class MarketScanner:
                     seen.add(symbol)
 
         self._stop_event = asyncio.Event()
-        # Event-Ticker des aktuellen BTC-Tagesleiter-Events (für ARB-Scan)
-        self._btc_ladder_event_ticker: str = ""
+        # Event-Ticker aller Crypto-Tages-Leiter-Events (für ARB-Scan)
+        self._ladder_event_tickers: list[str] = []
         # Tickers für die bereits ein Exit-Signal gesendet wurde.
         # Verhindert Doppel-Exits wenn Executor die Position noch nicht aus
         # positions.json entfernt hat bevor der nächste Scan-Zyklus läuft.
@@ -281,17 +281,18 @@ class MarketScanner:
             100,
         ))
 
-        # BTC-Tagesleiter Event-Ticker für ARB-Scan zurücksetzen
-        self._btc_ladder_event_ticker = ""
+        # Leiter Event-Ticker für ARB-Scan zurücksetzen
+        self._ladder_event_tickers = []
 
         for ev in crypto_events:
             et     = ev.get("event_ticker", "")
             series = (ev.get("series_ticker") or et.split("-")[0]).upper()
             is_15m = "15M" in series
 
-            # Erstes KXBTCD-Event für ARB-Scan merken
-            if series == "KXBTCD" and not self._btc_ladder_event_ticker:
-                self._btc_ladder_event_ticker = et
+            # Leiter-Event für ARB-Scan merken (alle Tages-Preisstufen-Serien)
+            _LADDER_SERIES = {"KXBTCD", "KXETHD", "KXSOLD", "KXXRPD", "KXDOGED", "KXBNBD"}
+            if series in _LADDER_SERIES and et not in self._ladder_event_tickers:
+                self._ladder_event_tickers.append(et)
 
             try:
                 r = await loop.run_in_executor(
@@ -537,27 +538,16 @@ class MarketScanner:
 
     async def _scan_ladder_arb(self, loop) -> int:
         """
-        Erkennt Preisumkehrungen auf der KXBTCD-Leiter.
+        Erkennt Preisumkehrungen auf allen Crypto-Tages-Leitern (BTC, ETH, SOL, ...).
 
-        Logische Bedingung: P(BTC > $X) ≥ P(BTC > $Y) wenn X < Y.
-        D.h. YES(T_tiefer) ≥ YES(T_höher) immer.
-
-        Wenn YES(T_höher) > YES(T_tiefer): Arbitrage möglich.
+        Logische Bedingung: P(Asset > $X) ≥ P(Asset > $Y) wenn X < Y.
+        Wenn YES(T_höher) > YES(T_tiefer): mathematischer Fehler → Arbitrage.
           → Kaufe YES auf T_tiefer (unterbewertet)
-          → Kaufe NO auf T_höher  (überbewertet)
+          → Kaufe NO  auf T_höher  (überbewertet)
           → In JEDEM Szenario profitabel.
         """
-        # BTC-Tagesleiter Event-Ticker aus _scan_crypto (kein hardcodierter Serien-Name)
-        if not self._btc_ladder_event_ticker:
+        if not self._ladder_event_tickers:
             return 0
-
-        mkt_data = await loop.run_in_executor(
-            None,
-            lambda: self._client.get_markets(
-                event_ticker=self._btc_ladder_event_ticker, status="open", limit=60
-            ),
-        )
-        markets = mkt_data.get("markets", [])
 
         def _price(m, key):
             v = m.get(key + "_dollars") or m.get(key)
@@ -567,96 +557,95 @@ class MarketScanner:
             return int(round(f * 100)) if f <= 1.0 else int(round(f))
 
         def _threshold(ticker: str) -> float:
-            """Zieht den numerischen Schwellenwert aus dem Ticker: T65799 → 65799"""
             try:
                 part = ticker.split("-T")[-1].replace(".99", "")
                 return float(part)
             except Exception:
                 return 0.0
 
-        # Nur Märkte mit bekanntem YES ask und ausreichend Volumen
-        valid = []
-        for m in markets:
-            ya = _price(m, "yes_ask")
-            vol = float(m.get("volume_24h_fp", 0) or 0)
-            if ya and vol >= 1000:
-                valid.append((m, _threshold(m.get("ticker", "")), ya))
-
-        if len(valid) < 2:
-            return 0
-
-        # Nach Schwelle aufsteigend sortieren (tiefer → höher)
-        valid.sort(key=lambda x: x[1])
-
         signals = 0
-        for i in range(len(valid) - 1):
-            m_low,  thr_low,  ya_low  = valid[i]
-            m_high, thr_high, ya_high = valid[i + 1]
-
-            if thr_high <= thr_low:
+        for evt_ticker in self._ladder_event_tickers:
+            try:
+                mkt_data = await loop.run_in_executor(
+                    None,
+                    lambda t=evt_ticker: self._client.get_markets(
+                        event_ticker=t, status="open", limit=60
+                    ),
+                )
+            except Exception as e:
+                logger.debug(f"[Scanner/ARB] {evt_ticker}: {e}")
                 continue
 
-            # Preisumkehr? YES(höhere Schwelle) > YES(niedrigere Schwelle)
-            if ya_high <= ya_low:
+            markets = mkt_data.get("markets", [])
+
+            valid = []
+            for m in markets:
+                ya  = _price(m, "yes_ask")
+                vol = float(m.get("volume_24h_fp", 0) or 0)
+                if ya and vol >= 500:
+                    valid.append((m, _threshold(m.get("ticker", "")), ya))
+
+            if len(valid) < 2:
                 continue
 
-            # Garantierter Gewinn: ya_low + (100 - ya_high) < 100
-            arb_cost = ya_low + (100 - ya_high)
-            arb_profit_min = 100 - arb_cost  # Mindestgewinn pro Contractpaar (Cent)
+            valid.sort(key=lambda x: x[1])
 
-            if arb_profit_min < 1:    # mind. 1¢ nach Spread
-                continue
+            for i in range(len(valid) - 1):
+                m_low,  thr_low,  ya_low  = valid[i]
+                m_high, thr_high, ya_high = valid[i + 1]
 
-            logger.info(
-                f"[Scanner/ARB] Preisumkehr! "
-                f"T{int(thr_low/1000)}k YES={ya_low}¢ < T{int(thr_high/1000)}k YES={ya_high}¢ | "
-                f"Mindestgewinn: {arb_profit_min}¢/Paar"
-            )
+                if thr_high <= thr_low:
+                    continue
+                if ya_high <= ya_low:
+                    continue
 
-            # Signal 1: YES auf die niedrigere (günstigere) Stufe
-            arb_ctx = {"arb": True, "arb_leg": "yes_low",
-                       "arb_pair_ticker": m_high.get("ticker")}
-            for sig in self._btc_ladder_rules.evaluate(
-                {**m_low, "_arb_force_yes": True}, context=arb_ctx
-            ) or []:
-                pass  # Arb nutzt eigene Signal-Erzeugung (s.u.)
+                arb_cost       = ya_low + (100 - ya_high)
+                arb_profit_min = 100 - arb_cost
 
-            # Direkte Signal-Erzeugung (nicht durch Regel-Engine, da garantierter Arb)
-            from strategy.rules import Signal
-            count = 5  # konservativ: 5 Contracts pro Arb-Leg
+                if arb_profit_min < 1:
+                    continue
 
-            evt_ticker = self._btc_ladder_event_ticker
-            await self._on_signal(Signal(
-                ticker    = m_low["ticker"],
-                rule_name = "ARB – YES günstige Stufe",
-                side      = "yes",
-                action    = "buy",
-                price_cents = ya_low + 1,
-                count     = count,
-                reason    = (f"Arb: T{int(thr_low/1000)}k YES={ya_low}¢ < "
-                             f"T{int(thr_high/1000)}k YES={ya_high}¢ → min +{arb_profit_min}¢/Paar"),
-                meta      = {"close_time": m_low.get("close_time", ""),
-                             "title": (m_low.get("title") or "").strip(),
-                             "event_ticker": evt_ticker,
-                             "category": "", "sub_title": "", "image_url": "",
-                             "arb": True, "arb_profit_min_cents": arb_profit_min},
-            ))
-            await self._on_signal(Signal(
-                ticker    = m_high["ticker"],
-                rule_name = "ARB – NO teure Stufe",
-                side      = "no",
-                action    = "buy",
-                price_cents = (100 - ya_high) + 1,
-                count     = count,
-                reason    = (f"Arb: T{int(thr_high/1000)}k YES={ya_high}¢ > "
-                             f"T{int(thr_low/1000)}k YES={ya_low}¢ → min +{arb_profit_min}¢/Paar"),
-                meta      = {"close_time": m_high.get("close_time", ""),
-                             "title": (m_high.get("title") or "").strip(),
-                             "event_ticker": evt_ticker,
-                             "category": "", "sub_title": "", "image_url": "",
-                             "arb": True, "arb_profit_min_cents": arb_profit_min},
-            ))
-            signals += 2
+                series = evt_ticker.split("-")[0]
+                logger.info(
+                    f"[Scanner/ARB] {series}: Preisumkehr! "
+                    f"T{thr_low:.0f} YES={ya_low}¢ < T{thr_high:.0f} YES={ya_high}¢ | "
+                    f"Mindestgewinn: {arb_profit_min}¢/Paar"
+                )
+
+                from strategy.rules import Signal
+                count = 5
+
+                await self._on_signal(Signal(
+                    ticker      = m_low["ticker"],
+                    rule_name   = "ARB – YES günstige Stufe",
+                    side        = "yes",
+                    action      = "buy",
+                    price_cents = ya_low + 1,
+                    count       = count,
+                    reason      = (f"Arb {series}: T{thr_low:.0f} YES={ya_low}¢ < "
+                                   f"T{thr_high:.0f} YES={ya_high}¢ → min +{arb_profit_min}¢/Paar"),
+                    meta        = {"close_time": m_low.get("close_time", ""),
+                                   "title": (m_low.get("title") or "").strip(),
+                                   "event_ticker": evt_ticker,
+                                   "category": "crypto", "sub_title": "", "image_url": "",
+                                   "arb": True, "arb_profit_min_cents": arb_profit_min},
+                ))
+                await self._on_signal(Signal(
+                    ticker      = m_high["ticker"],
+                    rule_name   = "ARB – NO teure Stufe",
+                    side        = "no",
+                    action      = "buy",
+                    price_cents = (100 - ya_high) + 1,
+                    count       = count,
+                    reason      = (f"Arb {series}: T{thr_high:.0f} YES={ya_high}¢ > "
+                                   f"T{thr_low:.0f} YES={ya_low}¢ → min +{arb_profit_min}¢/Paar"),
+                    meta        = {"close_time": m_high.get("close_time", ""),
+                                   "title": (m_high.get("title") or "").strip(),
+                                   "event_ticker": evt_ticker,
+                                   "category": "crypto", "sub_title": "", "image_url": "",
+                                   "arb": True, "arb_profit_min_cents": arb_profit_min},
+                ))
+                signals += 2
 
         return signals
 
