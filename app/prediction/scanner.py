@@ -69,10 +69,12 @@ class PredictionScanner:
         sys_cfg          = config.get("systems", {}).get(SYSTEM, {})
         self._bankroll   = float(sys_cfg.get("max_exposure_usd", 80.0))
 
-        self._rules          = PredictionRuleEngine(config)
-        self._stop_event     = asyncio.Event()
-        self._exit_pending:  set[str]        = set()
-        self._prev_yes_ask:  dict[str, int]  = {}  # für Überreaktions-Erkennung
+        self._rules                 = PredictionRuleEngine(config)
+        self._stop_event            = asyncio.Event()
+        self._exit_pending:  set[str]       = set()
+        self._prev_yes_ask:  dict[str, int] = {}  # für Überreaktions-Erkennung
+        self._exchange_trading:     bool    = True
+        self._last_exchange_check:  float   = 0.0
 
         logger.info(
             f"[Prediction/Scanner] Gestartet | Intervall: {self._interval_s}s | "
@@ -104,9 +106,21 @@ class PredictionScanner:
     # ── Scan-Zyklus ──────────────────────────────────────────────────── #
 
     async def _scan_cycle(self):
-        loop = asyncio.get_running_loop()
-        signals_total = 0
+        loop   = asyncio.get_running_loop()
+        now_ts = time.monotonic()
 
+        # Exchange-Status alle 5 Minuten prüfen
+        if now_ts - self._last_exchange_check > 300:
+            try:
+                status = await loop.run_in_executor(None, self._client.get_exchange_status)
+                self._exchange_trading      = bool(status.get("trading_active", True))
+                self._last_exchange_check   = now_ts
+            except Exception as e:
+                logger.debug(f"[Prediction/Scanner] Exchange-Status fehlgeschlagen: {e}")
+        if not self._exchange_trading:
+            return
+
+        signals_total = 0
         signals_total += await self._scan_entries(loop)
         signals_total += await self._scan_exits(loop)
 
@@ -174,7 +188,7 @@ class PredictionScanner:
                     ya   = int(round(ya_f * 100)) if ya_f <= 1.0 else int(round(ya_f))
                     prev = self._prev_yes_ask.get(ticker)
                     if prev is not None:
-                        market["_overreaction_delta"] = ya - prev
+                        market = {**market, "_overreaction_delta": ya - prev}
                     self._prev_yes_ask[ticker] = ya
                 except (ValueError, TypeError):
                     pass
@@ -226,11 +240,11 @@ class PredictionScanner:
             mins_left = float("inf")
             try:
                 ct        = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-                mins_left = max(0.0, (ct - now).total_seconds() / 60)
+                mins_left = (ct - now).total_seconds() / 60
             except Exception:
                 pass
 
-            if mins_left < 0:
+            if mins_left <= 0:
                 continue
 
             try:

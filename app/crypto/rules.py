@@ -154,7 +154,8 @@ class CryptoLadderRuleEngine:
                 continue
             sig = self._eval_rule(
                 rule, ticker, yes_ask, yes_bid, no_ask,
-                close_str, hours_left, spot, rsi, threshold_val, bankroll, market
+                close_str, hours_left, spot, rsi, threshold_val, bankroll, market,
+                ctx=ctx,
             )
             if sig:
                 signals.append(sig)
@@ -165,7 +166,8 @@ class CryptoLadderRuleEngine:
                    close_str: str, hours_left: float,
                    spot: Optional[float], rsi: Optional[float],
                    threshold_val: float, bankroll: float,
-                   market: dict) -> Optional[CryptoSignal]:
+                   market: dict, ctx: dict | None = None) -> Optional[CryptoSignal]:
+        ctx = ctx or {}
         name   = rule.get("name", "Unbenannt")
         cond   = rule.get("condition", {})
         act    = rule.get("action", {})

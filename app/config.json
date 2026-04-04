@@ -120,6 +120,7 @@
                 "oversold_threshold": 32
             },
             "action": {
+                "side": "no",
                 "order_type": "limit", "count": 3, "limit_offset_cents": 1
             }
         }

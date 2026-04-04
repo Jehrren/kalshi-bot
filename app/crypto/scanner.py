@@ -472,11 +472,11 @@ class CryptoScanner:
             mins_left = float("inf")
             try:
                 ct        = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-                mins_left = max(0.0, (ct - now).total_seconds() / 60)
+                mins_left = (ct - now).total_seconds() / 60
             except Exception:
                 pass
 
-            if mins_left < 0:
+            if mins_left <= 0:
                 continue
 
             try:
