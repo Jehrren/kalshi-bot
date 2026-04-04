@@ -35,6 +35,7 @@ class KalshiWSFeed:
         self._connected     = False
         self._stop_event    = asyncio.Event()
         self._listen_task   = None
+        self._lock          = asyncio.Lock()
 
     # ------------------------------------------------------------------ #
     #  Verbindung                                                          #
@@ -82,26 +83,27 @@ class KalshiWSFeed:
         """Abonniert neue Ticker (ignoriert bereits abonnierte)."""
         if not self._connected or not self._ws:
             return
-        new = [t for t in market_tickers if t not in self._subscribed]
-        if not new:
-            return
-        self._cmd_id += 1
-        cmd = {
-            "id": self._cmd_id,
-            "cmd": "subscribe",
-            "params": {
-                "channels": ["ticker"],
-                "market_tickers": new,
-                "send_initial_snapshot": True,
-            },
-        }
-        try:
-            await self._ws.send(json.dumps(cmd))
-            self._subscribed.update(new)
-            logger.debug(f"[WSFeed] Abonniert: {new}")
-        except Exception as e:
-            logger.warning(f"[WSFeed] Subscribe fehlgeschlagen: {e}")
-            self._connected = False
+        async with self._lock:
+            new = [t for t in market_tickers if t not in self._subscribed]
+            if not new:
+                return
+            self._cmd_id += 1
+            cmd = {
+                "id": self._cmd_id,
+                "cmd": "subscribe",
+                "params": {
+                    "channels": ["ticker"],
+                    "market_tickers": new,
+                    "send_initial_snapshot": True,
+                },
+            }
+            try:
+                await self._ws.send(json.dumps(cmd))
+                self._subscribed.update(new)
+                logger.debug(f"[WSFeed] Abonniert: {new}")
+            except Exception as e:
+                logger.warning(f"[WSFeed] Subscribe fehlgeschlagen: {e}")
+                self._connected = False
 
     async def unsubscribe_stale(self, active_tickers: set[str]) -> None:
         """Entfernt abgelaufene Ticker aus der internen Cache."""
@@ -115,39 +117,59 @@ class KalshiWSFeed:
     # ------------------------------------------------------------------ #
 
     async def _listen(self) -> None:
-        """Verarbeitet eingehende WS-Nachrichten und updated den Cache."""
-        try:
-            async for raw in self._ws:
-                if self._stop_event.is_set():
-                    break
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
+        """Verarbeitet eingehende WS-Nachrichten, updated den Cache und reconnectet bei Verbindungsabbruch."""
+        max_reconnects = 5
+        reconnect_count = 0
 
-                msg_type = msg.get("type", "")
+        while not self._stop_event.is_set():
+            try:
+                async for raw in self._ws:
+                    if self._stop_event.is_set():
+                        return
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
 
-                if msg_type == "ticker":
-                    market = msg.get("msg", {})
-                    ticker = market.get("ticker", "")
-                    if ticker:
-                        self._cache[ticker] = {**market, "_ws_ts": time.time()}
+                    msg_type = msg.get("type", "")
 
-                elif msg_type == "subscribed":
-                    logger.debug(f"[WSFeed] Subscription bestätigt: {msg.get('msg', {})}")
+                    if msg_type == "ticker":
+                        market = msg.get("msg", {})
+                        ticker = market.get("ticker", "")
+                        if ticker:
+                            self._cache[ticker] = {**market, "_ws_ts": time.time()}
 
-                elif msg_type == "error":
-                    err = msg.get("msg", {})
-                    logger.warning(f"[WSFeed] Server-Fehler: {err}")
+                    elif msg_type == "subscribed":
+                        logger.debug(f"[WSFeed] Subscription bestätigt: {msg.get('msg', {})}")
 
-        except ConnectionClosed as e:
-            logger.warning(f"[WSFeed] Verbindung getrennt: {e}")
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.warning(f"[WSFeed] Listen-Fehler: {e}")
-        finally:
-            self._connected = False
+                    elif msg_type == "error":
+                        err = msg.get("msg", {})
+                        logger.warning(f"[WSFeed] Server-Fehler: {err}")
+
+                # Sauberes Ende der async-for-Schleife (Server hat Verbindung geschlossen)
+                logger.warning("[WSFeed] Verbindung vom Server geschlossen")
+
+            except asyncio.CancelledError:
+                return
+            except ConnectionClosed as e:
+                logger.warning(f"[WSFeed] Verbindung getrennt: {e}")
+            except Exception as e:
+                logger.warning(f"[WSFeed] Listen-Fehler: {e}")
+
+            # Reconnect-Logik
+            if self._stop_event.is_set():
+                break
+            reconnect_count += 1
+            if reconnect_count > max_reconnects:
+                logger.error(f"[WSFeed] Max. Reconnect-Versuche ({max_reconnects}) erreicht – gebe auf")
+                break
+            logger.info(f"[WSFeed] Reconnect {reconnect_count}/{max_reconnects} in 2s …")
+            await asyncio.sleep(2)
+            if not await self.start():
+                logger.warning("[WSFeed] Reconnect fehlgeschlagen")
+                break
+
+        self._connected = False
 
     # ------------------------------------------------------------------ #
     #  Cache-Zugriff                                                       #

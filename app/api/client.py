@@ -15,7 +15,7 @@ Preise auf Kalshi sind in USD-Cent (0–100).
 import base64
 import logging
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -39,6 +39,23 @@ class KalshiClient:
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
     # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    #  HTTP with Retry                                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _with_retry(fn: Callable[[], requests.Response]) -> requests.Response:
+        """Führt fn bis zu 3 Mal aus; wiederholt bei HTTP 429/503 mit exponentiellem Backoff (1s, 2s, 4s)."""
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            r = fn()
+            if r.status_code not in (429, 503) or attempt == max_attempts - 1:
+                return r
+            wait = 2 ** attempt  # 1, 2, 4 Sekunden
+            logger.warning(f"[Client] HTTP {r.status_code} – Retry {attempt + 1}/{max_attempts - 1} in {wait}s")
+            time.sleep(wait)
+        return r  # wird von raise_for_status() im Caller behandelt
 
     def _sign(self, method: str, path: str) -> dict:
         """Erzeugt die Auth-Header für einen REST-Request (PATH_PREFIX wird vorangestellt)."""
@@ -70,34 +87,34 @@ class KalshiClient:
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         headers = self._sign("GET", path)
-        r = requests.get(
+        r = self._with_retry(lambda: requests.get(
             BASE_URL + PATH_PREFIX + path,
             headers=headers,
             params=params,
             timeout=10,
-        )
+        ))
         r.raise_for_status()
         return r.json()
 
     def _post(self, path: str, body: dict) -> dict:
         headers = self._sign("POST", path)
         headers["Content-Type"] = "application/json"
-        r = requests.post(
+        r = self._with_retry(lambda: requests.post(
             BASE_URL + PATH_PREFIX + path,
             headers=headers,
             json=body,
             timeout=10,
-        )
+        ))
         r.raise_for_status()
         return r.json()
 
     def _delete(self, path: str) -> dict:
         headers = self._sign("DELETE", path)
-        r = requests.delete(
+        r = self._with_retry(lambda: requests.delete(
             BASE_URL + PATH_PREFIX + path,
             headers=headers,
             timeout=10,
-        )
+        ))
         r.raise_for_status()
         return r.json()
 
@@ -112,8 +129,9 @@ class KalshiClient:
     def get_positions(self) -> list[dict]:
         positions = []
         cursor = ""
-        while True:
-            params = {"limit": 100}
+        max_iterations = 50  # 50 × 100 = 5 000 Positionen als Obergrenze
+        for _ in range(max_iterations):
+            params: dict = {"limit": 100}
             if cursor:
                 params["cursor"] = cursor
             data = self._get("/portfolio/positions", params)
@@ -197,6 +215,44 @@ class KalshiClient:
             params["min_close_ts"] = min_close_ts
         return self._get("/events", params).get("events", [])
 
+    def get_all_events(
+        self,
+        status: str = "open",
+        with_nested_markets: bool = True,
+        category: Optional[str] = None,
+        max_pages: int = 20,
+    ) -> list[dict]:
+        """Lädt ALLE Events paginiert (kein hartes Limit).
+        with_nested_markets=True: Märkte direkt inline – spart N Folge-Calls.
+        category: optionaler API-Filter (z.B. 'crypto'); None = alle Kategorien.
+        """
+        events: list[dict] = []
+        cursor = ""
+        for _ in range(max_pages):
+            params: dict = {"status": status, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            if with_nested_markets:
+                params["with_nested_markets"] = "true"
+            if category:
+                params["category"] = category
+            data = self._get("/events", params)
+            batch = data.get("events", [])
+            if not batch:
+                break
+            events.extend(batch)
+            cursor = data.get("cursor", "")
+            if not cursor:
+                break
+        return events
+
+    def get_all_crypto_events(self, max_pages: int = 30) -> list[dict]:
+        """Lädt alle offenen Crypto-Events inkl. Märkte (paginiert). Wrapper um get_all_events()."""
+        return self.get_all_events(
+            status="open", with_nested_markets=True,
+            category="crypto", max_pages=max_pages,
+        )
+
     def get_event_metadata(self, event_ticker: str) -> dict:
         """Metadata inkl. image_url für ein Event (GET /events/{ticker}/metadata)."""
         return self._get(f"/events/{event_ticker}/metadata")
@@ -258,3 +314,7 @@ class KalshiClient:
     def get_exchange_status(self) -> dict:
         """Exchange-Status (öffentlich, kein Auth nötig laut Doku – nutzt aber _get für Konsistenz)."""
         return self._get("/exchange/status")
+
+    def get_exchange_schedule(self) -> dict:
+        """Exchange-Handelszeiten (GET /exchange/schedule). Liefert standard_hours + maintenance_windows."""
+        return self._get("/exchange/schedule")

@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 MAX_FILE_SIZE  = 10 * 1024 * 1024
 MAX_KEEP_FILES = 3
 _FILE_HANDLES: dict[str, object] = {}
+_ATEXIT_REGISTERED = False
 
 
 def _now_iso() -> str:
@@ -36,18 +37,24 @@ def _rotate_if_needed(filepath: str):
 
 
 def _get_handle(filepath: str):
+    global _ATEXIT_REGISTERED
     if filepath not in _FILE_HANDLES:
         Path(filepath).parent.mkdir(parents=True, exist_ok=True)
         _FILE_HANDLES[filepath] = open(filepath, "a", encoding="utf-8")
-        atexit.register(lambda: [h.close() for h in _FILE_HANDLES.values()])
+        if not _ATEXIT_REGISTERED:
+            atexit.register(lambda: [h.close() for h in _FILE_HANDLES.values()])
+            _ATEXIT_REGISTERED = True
     return _FILE_HANDLES[filepath]
 
 
 def _write(filepath: str, record: dict):
     _rotate_if_needed(filepath)
     h = _get_handle(filepath)
-    h.write(json.dumps(record, ensure_ascii=False) + "\n")
-    h.flush()
+    try:
+        h.write(json.dumps(record, ensure_ascii=False) + "\n")
+        h.flush()
+    except OSError as e:
+        logger.error(f"[Logger] Schreibfehler {filepath}: {e}")
 
 
 class TradeLogger:

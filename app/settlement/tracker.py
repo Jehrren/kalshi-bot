@@ -17,6 +17,8 @@ Gebühren-Modell (Kalshi-Standard):
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,7 +67,10 @@ class SettlementTracker:
     def _write_balance(self, bal: dict):
         BALANCE_FILE.parent.mkdir(parents=True, exist_ok=True)
         bal["updated_at"] = datetime.now(timezone.utc).isoformat()
-        BALANCE_FILE.write_text(json.dumps(bal, ensure_ascii=False, indent=2))
+        content = json.dumps(bal, ensure_ascii=False, indent=2)
+        tmp = BALANCE_FILE.with_suffix(".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(BALANCE_FILE)
 
     def get_balance(self) -> dict:
         return dict(self._balance)
@@ -128,7 +133,7 @@ class SettlementTracker:
         if not pending:
             return
         logger.info(f"[Settlement] {len(pending)} abgelaufene Position(en) werden geprüft")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for trade in pending:
             ticker = trade.get("ticker", "")
             try:
@@ -168,7 +173,7 @@ class SettlementTracker:
             exit_cnt  = int(ex.get("count", 0))
             if not entry_px or not entry_cnt:
                 continue
-            invested_usd   = round(entry_cnt * entry_px / 100, 4)
+            invested_usd   = round(exit_cnt * entry_px / 100, 4)
             received_usd   = round(exit_cnt  * exit_px  / 100, 4)
             pnl_usd        = round(received_usd - invested_usd, 4)
             won            = pnl_usd > 0

@@ -126,20 +126,23 @@ class BingXFeed:
     # ------------------------------------------------------------------ #
 
     def is_ready(self) -> bool:
-        return len(self._candles) >= 20
+        return len(self._candles) >= 30
 
     def rsi(self, period: int = 14) -> Optional[float]:
         closes = [c[3] for c in self._candles]
         if len(closes) < period + 1:
             return None
-        closes = closes[-(period + 1):]
         gains, losses = [], []
         for i in range(1, len(closes)):
             delta = closes[i] - closes[i - 1]
             gains.append(max(delta, 0))
             losses.append(max(-delta, 0))
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
+        # Wilder's smoothed RSI: SMA für erste avg_gain/avg_loss, dann exponentiell glätten
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+        for i in range(period, len(gains)):
+            avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+            avg_loss = (avg_loss * (period - 1) + losses[i]) / period
         if avg_loss == 0:
             return 100.0
         rs = avg_gain / avg_loss
@@ -172,9 +175,10 @@ class BingXFeed:
     def vol_ratio(self) -> Optional[float]:
         """Aktuelles Volumen vs. 20-Perioden-Durchschnitt."""
         vols = [c[4] for c in self._candles]
-        if len(vols) < 5:
+        if len(vols) < 22:
             return None
-        avg = sum(vols[-20:]) / len(vols[-20:])
+        ref = vols[-21:-1]   # 20 Candles EXKL. aktueller
+        avg = sum(ref) / len(ref)
         if avg == 0:
             return None
         return round(vols[-1] / avg, 2)
