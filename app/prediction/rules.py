@@ -53,15 +53,19 @@ def polymarket_corrected_prob(yes_ask_cents: int) -> float:
 
 def kelly_count(price_cents: int, true_prob_win: float,
                 bankroll_usd: float, fraction: float = 0.25,
-                min_count: int = 1, max_count: int = 10) -> int:
-    """Quarter-Kelly Position Sizing. Gibt 0 zurück wenn kein positiver Edge."""
+                min_count: int = 1, max_count: int = 10,
+                fee_pct: float = 1.0) -> int:
+    """Quarter-Kelly Position Sizing mit Gebührenabzug. Gibt 0 zurück wenn kein positiver Edge."""
     cost = price_cents / 100.0
     if cost <= 0 or cost >= 1 or true_prob_win <= 0:
         return min_count
-    b       = (1.0 - cost) / cost
-    q       = 1.0 - true_prob_win
-    f_star  = (true_prob_win * b - q) / b
+    fee    = fee_pct / 100.0
+    b      = (1.0 - cost) * (1.0 - fee) / cost
+    q      = 1.0 - true_prob_win
+    f_star = (true_prob_win * b - q) / b
     if f_star <= 0:
+        return 0
+    if f_star * fraction < 0.01:
         return 0
     bet_usd = f_star * fraction * bankroll_usd
     count   = int(bet_usd / cost)
@@ -193,6 +197,20 @@ class PredictionRuleEngine:
                         side    = "no"
                 except Exception:
                     pass
+
+        elif t == "overreaction":
+            delta       = int(market.get("_overreaction_delta", 0))
+            min_delta   = int(cond.get("delta_cents", 8))
+            overbought  = int(cond.get("overbought_threshold", 68))
+            oversold    = int(cond.get("oversold_threshold", 32))
+            if delta >= min_delta and yes_ask is not None and yes_ask >= overbought:
+                matched = True
+                side    = "no"
+                reason  = f"Überreaktion: YES {yes_ask}¢ (+{delta}¢) → NO kontrarian"
+            elif delta <= -min_delta and yes_ask is not None and yes_ask <= oversold:
+                matched = True
+                side    = "yes"
+                reason  = f"Überreaktion: YES {yes_ask}¢ (-{abs(delta)}¢) → YES kontrarian"
 
         if not matched:
             return None

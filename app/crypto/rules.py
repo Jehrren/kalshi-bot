@@ -57,15 +57,26 @@ def crypto_corrected_yes_prob(yes_ask_cents: int) -> float:
 
 def kelly_count(price_cents: int, true_prob_win: float,
                 bankroll_usd: float, fraction: float = 0.25,
-                min_count: int = 1, max_count: int = 15) -> int:
-    """Quarter-Kelly Position Sizing."""
+                min_count: int = 1, max_count: int = 15,
+                fee_pct: float = 1.0) -> int:
+    """Quarter-Kelly Position Sizing mit Gebühren-Abzug.
+
+    fee_pct: Kalshi Settlement-Fee in Prozent (default 1.0 = 1%).
+    Reduziert den effektiven Gewinn und damit den Kelly-Faktor.
+    Gibt 0 zurück wenn kein positiver Edge nach Gebühren besteht.
+    """
     cost = price_cents / 100.0
     if cost <= 0 or cost >= 1 or true_prob_win <= 0:
         return min_count
-    b       = (1.0 - cost) / cost
+    fee   = fee_pct / 100.0
+    # Netto-Gewinn nach Fee: (1 - cost) * (1 - fee)
+    b       = (1.0 - cost) * (1.0 - fee) / cost
     q       = 1.0 - true_prob_win
     f_star  = (true_prob_win * b - q) / b
     if f_star <= 0:
+        return 0
+    # Untergrenze: wenn Kelly < 1% empfiehlt, kein Trade
+    if f_star * fraction < 0.01:
         return 0
     bet_usd = f_star * fraction * bankroll_usd
     count   = int(bet_usd / cost)
@@ -228,6 +239,25 @@ class CryptoLadderRuleEngine:
         if not matched:
             return None
 
+        # ── Trend-Filter für YES-Käufe ────────────────────────────────
+        if side == "yes":
+            trend = ctx.get("bingx_trend")
+            if trend and trend == "down":
+                logger.debug(
+                    f"[Crypto/Ladder] {ticker} – YES-Kauf blockiert: Trend='{trend}' (abwärts)"
+                )
+                return None
+
+        # ── OB-Imbalance-Filter für NO-Käufe ─────────────────────────
+        if side == "no":
+            ob_imb = ctx.get("bingx_ob_imbalance")
+            if ob_imb and ob_imb > 1.2:
+                logger.debug(
+                    f"[Crypto/Ladder] {ticker} – NO-Kauf blockiert: "
+                    f"OB-Imbalance={ob_imb:.2f} > 1.2 (starker Kaufdruck)"
+                )
+                return None
+
         # Limit-Preis
         if side == "yes":
             px = max(1, min(99, (yes_ask or 50) + offset))
@@ -353,24 +383,30 @@ class Crypto15MinRuleEngine:
         if change is None:
             return None
 
-        bias_thr   = int(float(cond.get("bias_threshold", 0.65)) * 100)
-        change_thr = float(cond.get("change_threshold_pct", 0.4))
-        rsi_ob     = float(cond.get("rsi_overbought", 68))
-        rsi_os     = float(cond.get("rsi_oversold",   32))
-        count      = int(act.get("count", 5))
-        offset     = int(act.get("limit_offset_cents", 1))
+        bias_thr      = int(float(cond.get("bias_threshold", 0.65)) * 100)
+        change_thr    = float(cond.get("change_threshold_pct", 0.6))
+        rsi_ob        = float(cond.get("rsi_overbought", 72))
+        rsi_os        = float(cond.get("rsi_oversold",   28))
+        vol_ratio_min = float(cond.get("vol_ratio_min",  1.1))
+        count         = int(act.get("count", 5))
+        offset        = int(act.get("limit_offset_cents", 1))
 
         side, matched, reason = "no", False, ""
 
         if rsi is not None:
-            if rsi >= rsi_ob and yes_ask is not None and yes_ask >= bias_thr and vol_ratio >= 0.8:
+            if rsi >= rsi_ob and yes_ask is not None and yes_ask >= bias_thr and vol_ratio >= vol_ratio_min:
                 matched = True
-                reason  = f"RSI={rsi:.0f} überkauft / UP={yes_ask}¢ → DOWN fade"
+                reason  = f"RSI={rsi:.0f} überkauft / UP={yes_ask}¢ → DOWN fade | Vol={vol_ratio:.2f}"
                 side    = "no"
-            elif rsi <= rsi_os and yes_ask is not None and yes_ask <= (100 - bias_thr) and vol_ratio >= 0.8:
+            elif rsi <= rsi_os and yes_ask is not None and yes_ask <= (100 - bias_thr) and vol_ratio >= vol_ratio_min:
                 matched = True
-                reason  = f"RSI={rsi:.0f} überverkauft / UP={yes_ask}¢ → UP fade"
+                reason  = f"RSI={rsi:.0f} überverkauft / UP={yes_ask}¢ → UP fade | Vol={vol_ratio:.2f}"
                 side    = "yes"
+            else:
+                logger.debug(
+                    f"[15-Min] {ticker} kein Signal: RSI={rsi:.0f} "
+                    f"(OB≥{rsi_ob}, OS≤{rsi_os}), Vol={vol_ratio:.2f} (min {vol_ratio_min})"
+                )
         else:
             if change >= change_thr and yes_ask is not None and yes_ask >= bias_thr:
                 matched = True

@@ -26,6 +26,7 @@
         "interval_seconds": 60,
         "max_close_days": 30,
         "min_volume_usd": 100,
+        "overreaction_delta_cents": 8,
         "categories": [
             "economics", "financials", "politics", "elections", "companies",
             "world", "health", "science and technology", "entertainment",
@@ -98,15 +99,29 @@
         },
         {
             "name": "Time Decay – Überschätztes YES mit langer Laufzeit → NO",
-            "description": "Märkte mit 14+ Tagen: YES 18–62¢ verfällt tägl. ~0.2% wenn Ereignis ausbleibt.",
+            "description": "Märkte mit 14+ Tagen: YES 20–45¢ hat besten Theta-Edge ohne zu extremes Risiko.",
             "enabled": true,
             "condition": {
                 "type": "time_decay_no",
                 "min_days_remaining": 14,
-                "yes_ask_min": 18,
-                "yes_ask_max": 62
+                "yes_ask_min": 20,
+                "yes_ask_max": 45
             },
             "action": { "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1 }
+        },
+        {
+            "name": "Überreaktions-Erkennung – aktiviert",
+            "description": "Kontrarian-Einstieg nach scharfen Moves (≥8¢ in einem Scan-Zyklus).",
+            "enabled": true,
+            "condition": {
+                "type": "overreaction",
+                "delta_cents": 8,
+                "overbought_threshold": 68,
+                "oversold_threshold": 32
+            },
+            "action": {
+                "order_type": "limit", "count": 3, "limit_offset_cents": 1
+            }
         }
     ],
 
@@ -114,8 +129,18 @@
         "interval_seconds": 30,
         "ladder_enabled": true,
         "min15_enabled": true,
-        "min_volume_usd": 25,
-        "ladder_min_volume_usd": 100
+        "min_volume_usd": 100,
+        "min_volume_by_series": {
+            "KXBTCD": 1000,
+            "KXETHD": 500,
+            "KXSOLD": 250,
+            "KXBNBD": 250,
+            "KXXRPD": 100,
+            "KXDOGED": 50,
+            "KXHYPE": 0,
+            "KXSHIBA": 0
+        },
+        "max_concurrent_per_asset": 2
     },
 
     "crypto_ladder_rules": [
@@ -181,14 +206,15 @@
         },
         {
             "name": "15-Min – Mean Reversion",
-            "description": "Faded Retail-Überreaktion. RSI-bestätigt. Kleinere Position (5ct statt 10ct).",
+            "description": "Faded Retail-Überreaktion. RSI-bestätigt. Nur bei erhöhtem Volumen (>1.1× DMA).",
             "enabled": true,
             "condition": {
                 "type": "btc_15min_mean_reversion",
-                "change_threshold_pct": 0.4,
+                "change_threshold_pct": 0.6,
                 "bias_threshold": 0.65,
-                "rsi_overbought": 68,
-                "rsi_oversold": 32
+                "rsi_overbought": 72,
+                "rsi_oversold": 28,
+                "vol_ratio_min": 1.1
             },
             "action": { "order_type": "limit", "count": 5, "limit_offset_cents": 1 }
         }

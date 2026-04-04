@@ -5,7 +5,7 @@ Scannt politische, wirtschaftliche und allgemeine Märkte auf Kalshi.
 Hat eigene Entry- und Exit-Logik – komplett getrennt vom Crypto-System.
 
 Exit-Bedingungen:
-  1. Take-Profit : Bid ≥ 1.8× Einstieg (Prediction Markets sind träger)
+  1. Take-Profit : Bid ≥ 2.2× Einstieg (Prediction Markets sind träger)
   2. Zeit-Stop   : < 30 Min, Position hat > 60% des Einsatzes verloren
   3. (Kein Spot-Stop-Loss – keine Crypto-Preisbezüge)
 """
@@ -69,9 +69,10 @@ class PredictionScanner:
         sys_cfg          = config.get("systems", {}).get(SYSTEM, {})
         self._bankroll   = float(sys_cfg.get("max_exposure_usd", 80.0))
 
-        self._rules      = PredictionRuleEngine(config)
-        self._stop_event = asyncio.Event()
-        self._exit_pending: set[str] = set()
+        self._rules          = PredictionRuleEngine(config)
+        self._stop_event     = asyncio.Event()
+        self._exit_pending:  set[str]        = set()
+        self._prev_yes_ask:  dict[str, int]  = {}  # für Überreaktions-Erkennung
 
         logger.info(
             f"[Prediction/Scanner] Gestartet | Intervall: {self._interval_s}s | "
@@ -163,9 +164,24 @@ class PredictionScanner:
 
         signals = 0
         for market in markets:
+            ticker = market.get("ticker", "")
+
+            # Überreaktions-Delta berechnen und ins market-Dict injizieren
+            ya_raw = market.get("yes_ask_dollars") or market.get("yes_ask")
+            if ya_raw is not None:
+                try:
+                    ya_f = float(ya_raw)
+                    ya   = int(round(ya_f * 100)) if ya_f <= 1.0 else int(round(ya_f))
+                    prev = self._prev_yes_ask.get(ticker)
+                    if prev is not None:
+                        market["_overreaction_delta"] = ya - prev
+                    self._prev_yes_ask[ticker] = ya
+                except (ValueError, TypeError):
+                    pass
+
             if self._on_meta:
                 self._on_meta(
-                    market.get("ticker", ""),
+                    ticker,
                     event_title=market.get("event_title", ""),
                     image_url=market.get("image_url", ""),
                     sub_title=market.get("sub_title", ""),
@@ -180,7 +196,7 @@ class PredictionScanner:
     async def _scan_exits(self, loop) -> int:
         """
         Prediction-Market Exit-Logik:
-          1. Take-Profit : Bid ≥ 1.8× Einstieg
+          1. Take-Profit : Bid ≥ 2.2× Einstieg
           2. Zeit-Stop   : < 30 Min + mehr als 60% des Einsatzes verloren
         """
         try:
@@ -241,10 +257,10 @@ class PredictionScanner:
             sell_price: int = max(1, entry_px - 1)
 
             if side == "no":
-                # Take-Profit: NO Bid ≥ 1.8× Einstieg
-                tp_target = int(entry_px * 1.8)
+                # Take-Profit: NO Bid ≥ 2.2× Einstieg
+                tp_target = int(entry_px * 2.2)
                 if no_bid and no_bid >= tp_target:
-                    exit_reason = f"Take-Profit: NO bid {no_bid}¢ ≥ 1.8× {entry_px}¢"
+                    exit_reason = f"Take-Profit: NO bid {no_bid}¢ ≥ 2.2× {entry_px}¢"
                     sell_price  = max(1, no_bid - 1)
                 # Zeit-Stop: < 30 Min + mehr als 60% Verlust
                 elif mins_left < 30 and no_bid and no_bid < int(entry_px * 0.4):
@@ -255,8 +271,8 @@ class PredictionScanner:
                     sell_price = max(1, no_bid or 1)
 
             elif side == "yes":
-                # Take-Profit: YES Bid ≥ 1.8× Einstieg (cap 95¢)
-                tp_target = min(95, int(entry_px * 1.8))
+                # Take-Profit: YES Bid ≥ 2.2× Einstieg (cap 95¢)
+                tp_target = min(95, int(entry_px * 2.2))
                 if yes_bid and yes_bid >= tp_target:
                     exit_reason = f"Take-Profit: YES bid {yes_bid}¢ ≥ {tp_target}¢"
                     sell_price  = max(1, yes_bid - 1)
@@ -269,6 +285,15 @@ class PredictionScanner:
                     sell_price = max(1, yes_bid or 1)
 
             if not exit_reason:
+                continue
+
+            # Exit-Guard: kein Sell wenn bid < 2¢ (illiquide – warten bis Liquidität zurück)
+            exit_bid = no_bid if side == "no" else yes_bid
+            if not exit_bid or exit_bid < 2:
+                logger.debug(
+                    f"[Prediction/Exit] {ticker} {side.upper()} bid {exit_bid}¢ < 2¢ "
+                    f"– illiquide, überspringe"
+                )
                 continue
 
             logger.info(

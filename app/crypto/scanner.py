@@ -75,7 +75,9 @@ class CryptoScanner:
         self._interval_s  = int(scan_cfg.get("interval_seconds", 30))
         self._ladder_on   = bool(scan_cfg.get("ladder_enabled", True))
         self._min15_on    = bool(scan_cfg.get("min15_enabled", True))
-        self._min_vol     = float(scan_cfg.get("min_volume_usd", 25))
+        self._min_vol            = float(scan_cfg.get("min_volume_usd", 25))
+        self._min_vol_by_series  = dict(scan_cfg.get("min_volume_by_series", {}))
+        self._max_concurrent     = int(scan_cfg.get("max_concurrent_per_asset", 2))
 
         sys_cfg           = config.get("systems", {}).get(SYSTEM, {})
         self._bankroll    = float(sys_cfg.get("max_exposure_usd", 80.0))
@@ -249,8 +251,9 @@ class CryptoScanner:
                         active_15m_tickers.add(m.get("ticker", ""))
                         min15_markets.append(m)
                 else:
-                    vol = float(m.get("volume_24h_fp", 0) or 0)
-                    if self._min_vol > 0 and vol < self._min_vol:
+                    vol            = float(m.get("volume_24h_fp", 0) or 0)
+                    series_min_vol = self._min_vol_by_series.get(series, self._min_vol)
+                    if vol < series_min_vol:
                         continue
                     # Distanz-Filter
                     sym = series_to_symbol(series)
@@ -271,13 +274,43 @@ class CryptoScanner:
         markets = [m for m in markets if not m.get("ticker", "").startswith("KXMVECROSSCATEGORY")]
         # Mindest-NO-Preis ≥ 5¢
         markets = [m for m in markets if (_pc(m, "no_ask") or 0) >= 5]
+        # Nach Volumen sortieren – höchste Liquidität zuerst
+        markets.sort(key=lambda m: float(m.get("volume_24h_fp", 0) or 0), reverse=True)
+
+        # Positionen laden: Concurrent-Limit + Cross-Track-Hedge
+        concurrent_by_series: dict[str, int] = defaultdict(int)
+        active_15m_symbols:   set[str]       = set()
+        try:
+            pos_data = json.loads(Path("data/positions.json").read_text())
+            for p in pos_data.get("positions", []):
+                if p.get("system") != SYSTEM:
+                    continue
+                if p.get("track") == "crypto_15min":
+                    sym_15m = series_to_symbol(p.get("ticker", "").split("-")[0])
+                    if sym_15m:
+                        active_15m_symbols.add(sym_15m)
+                else:
+                    series_key = p.get("ticker", "").split("-")[0]
+                    concurrent_by_series[series_key] += 1
+        except Exception:
+            pass
 
         logger.info(f"[Crypto/Scanner] {len(markets)} Leiter-Märkte")
 
         signals = 0
         for market in markets:
-            sym     = series_to_symbol(market.get("_series", "")) or "BTC-USDT"
-            ctx     = sym_ctxs.get(sym, {"bankroll_usd": bankroll_usd})
+            series_key = market.get("_series", "")
+            sym        = series_to_symbol(series_key) or "BTC-USDT"
+
+            # Concurrent-Limit: max. N offene Positionen pro Serie
+            if concurrent_by_series.get(series_key, 0) >= self._max_concurrent:
+                continue
+
+            # Cross-Track Hedge-Check: kein Leiter-Einstieg wenn 15-Min-Position auf gleichem Asset
+            if sym in active_15m_symbols:
+                continue
+
+            ctx = sym_ctxs.get(sym, {"bankroll_usd": bankroll_usd})
             for cs in self._ladder_rules.evaluate(market, ctx):
                 await self._on_signal(_to_executor_signal(cs))
                 signals += 1
@@ -516,6 +549,15 @@ class CryptoScanner:
                     sell_price = max(1, yes_bid or 1)
 
             if not exit_reason:
+                continue
+
+            # Exit-Guard: kein Sell wenn bid < 2¢ (illiquide – warten bis Liquidität zurück)
+            exit_bid = no_bid if side == "no" else yes_bid
+            if not exit_bid or exit_bid < 2:
+                logger.debug(
+                    f"[Crypto/Exit] {ticker} {side.upper()} bid {exit_bid}¢ < 2¢ "
+                    f"– illiquide, überspringe"
+                )
                 continue
 
             logger.info(
