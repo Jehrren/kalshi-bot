@@ -27,6 +27,7 @@ class RiskManager:
     def __init__(self, client: KalshiClient, config: dict):
         self._client  = client
         self._dry_run = bool(config.get("dry_run", False))
+        self._config  = config
         risk = config.get("risk", {})
         self.max_position_usd       = float(risk.get("max_position_usd", 50.0))
         self.max_total_exposure_usd = float(risk.get("max_total_exposure_usd", 200.0))
@@ -46,8 +47,9 @@ class RiskManager:
             if not data.get("dry_run"):
                 return  # Nur Dry-Run-Daten laden
             detail_keys = [
-                "side", "price_cents", "count", "rule_name", "title",
+                "side", "price_cents", "count", "rule_name", "title", "event_title",
                 "reason", "entered_at", "category", "event_ticker", "sub_title", "image_url",
+                "system",
             ]
             loaded = 0
             for p in data.get("positions", []):
@@ -140,7 +142,9 @@ class RiskManager:
                     "max_positions": self.max_open_positions,
                 },
             }
-            POSITIONS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+            tmp = POSITIONS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(POSITIONS_FILE)
         except Exception as e:
             logger.debug(f"[Risk] positions.json konnte nicht geschrieben werden: {e}")
 
@@ -150,10 +154,17 @@ class RiskManager:
     def get_open_count(self) -> int:
         return len(self._positions)
 
-    def check_order_allowed(self, ticker: str, count: int, price_cents: int) -> tuple[bool, str]:
-        exposure_usd = count * price_cents / 100
+    def _system_exposure(self, system: str) -> float:
+        """Berechnet die aktuelle Exposure eines Systems."""
+        return sum(
+            exp for tkr, exp in self._positions.items()
+            if self._details.get(tkr, {}).get("system") == system
+        )
 
-        current = self._positions.get(ticker, 0.0)
+    def check_order_allowed(self, ticker: str, count: int, price_cents: int,
+                            system: str = "") -> tuple[bool, str]:
+        exposure_usd = count * price_cents / 100
+        current      = self._positions.get(ticker, 0.0)
 
         # Im Dry-Run: bereits positionierte Märkte nicht nochmals bespielen.
         # Entspricht dem Verhalten einer noch ruhenden Limit-Order im echten Betrieb.
@@ -164,12 +175,22 @@ class RiskManager:
             return False, (f"Max-Position überschritten: {current:.2f} + "
                            f"{exposure_usd:.2f} > {self.max_position_usd:.2f} USD")
 
+        # System-Budget prüfen (wenn konfiguriert)
+        if system:
+            sys_cfg     = self._config.get("systems", {}).get(system, {})
+            sys_max_usd = float(sys_cfg.get("max_exposure_usd", self.max_total_exposure_usd))
+            sys_current = self._system_exposure(system)
+            if sys_current + exposure_usd > sys_max_usd:
+                return False, (f"System-Budget '{system}' überschritten: "
+                               f"${sys_current:.2f} + ${exposure_usd:.2f} > ${sys_max_usd:.2f}")
+
         total = self.get_total_exposure()
         if total + exposure_usd > self.max_total_exposure_usd:
             return False, (f"Max-Exposure überschritten: {total:.2f} + "
                            f"{exposure_usd:.2f} > {self.max_total_exposure_usd:.2f} USD")
 
-        if self.max_open_positions > 0 and ticker not in self._positions and self.get_open_count() >= self.max_open_positions:
+        if (self.max_open_positions > 0 and ticker not in self._positions
+                and self.get_open_count() >= self.max_open_positions):
             return False, (f"Max. offene Positionen erreicht: "
                            f"{self.get_open_count()} >= {self.max_open_positions}")
 
@@ -177,9 +198,9 @@ class RiskManager:
 
     def record_order(self, ticker: str, count: int, price_cents: int, is_buy: bool,
                      close_time: str = "", *, side: str = "", rule_name: str = "",
-                     title: str = "", reason: str = "", entered_at: str = "",
+                     title: str = "", event_title: str = "", reason: str = "", entered_at: str = "",
                      category: str = "", event_ticker: str = "", sub_title: str = "",
-                     image_url: str = ""):
+                     image_url: str = "", system: str = ""):
         exposure = count * price_cents / 100
         if is_buy:
             self._positions[ticker] = self._positions.get(ticker, 0.0) + exposure
@@ -192,12 +213,14 @@ class RiskManager:
                     "count": count,
                     "rule_name": rule_name,
                     "title": title,
+                    "event_title": event_title,
                     "reason": reason,
                     "entered_at": entered_at or datetime.now(timezone.utc).isoformat(),
                     "category": category,
                     "event_ticker": event_ticker,
                     "sub_title": sub_title,
                     "image_url": image_url,
+                    "system": system,
                 }
         else:
             # Exit = Position vollständig schließen, unabhängig vom Sell-Preis.
@@ -207,6 +230,18 @@ class RiskManager:
             self._expiry.pop(ticker, None)
             self._details.pop(ticker, None)
         self._save_positions()
+
+    def update_detail(self, ticker: str, **kwargs):
+        """Füllt fehlende Felder in _details nach (z.B. event_title für Altpositionen)."""
+        if ticker not in self._details:
+            return
+        changed = False
+        for key, val in kwargs.items():
+            if val and not self._details[ticker].get(key):
+                self._details[ticker][key] = val
+                changed = True
+        if changed:
+            self._save_positions()
 
     def get_summary(self) -> dict:
         return {
