@@ -7,59 +7,98 @@
         "starting_balance_usd": 200.0
     },
 
-    "scanner": {
-        "interval_seconds": 30,
-        "btc_ladder_enabled": true,
-        "btc_15min_enabled": true,
+    "systems": {
+        "prediction": {
+            "enabled": true,
+            "max_exposure_usd": 80.0,
+            "max_position_usd": 20.0,
+            "max_open_positions": 15
+        },
+        "crypto": {
+            "enabled": true,
+            "max_exposure_usd": 80.0,
+            "max_position_usd": 20.0,
+            "max_open_positions": 10
+        }
+    },
+
+    "prediction_scanner": {
+        "interval_seconds": 60,
         "max_close_days": 30,
+        "min_volume_usd": 100,
         "categories": [
             "economics", "financials", "politics", "elections", "companies",
             "world", "health", "science and technology", "entertainment",
             "social", "climate and weather", "transportation"
-        ],
-        "max_markets_per_scan": 200,
-        "min_volume_usd": 25
+        ]
     },
 
-    "rules": [
+    "prediction_rules": [
         {
-            "name": "Filter – Mindest 24h-Volumen $100",
-            "description": "Eliminiert tote Märkte: hohe OI + kein Tagesvolumen = kein aktiver Counterparty",
+            "name": "Filter – 50/50-Zone (43–57¢)",
+            "description": "Schlechteste Kalibrierung: bis zu 7% YES-Bias, kein Edge",
+            "enabled": true,
+            "condition": { "type": "yes_ask_between", "threshold_low": 43, "threshold_high": 57 },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Filter – Min. Volumen $100",
+            "description": "Tote Märkte ohne aktiven Counterparty überspringen",
             "enabled": true,
             "condition": { "type": "min_volume_usd", "threshold": 100 },
             "action": { "side": "SKIP" }
         },
         {
-            "name": "Filter – Mindest Open Interest $500",
-            "description": "Kein Markt ohne echtes gebundenes Kapital – sonst kein Fill möglich",
+            "name": "Filter – Min. Open Interest $500",
+            "description": "Kein Markt ohne gebundenes Kapital – sonst kein Fill",
             "enabled": true,
             "condition": { "type": "min_open_interest_usd", "threshold": 500 },
             "action": { "side": "SKIP" }
         },
         {
-            "name": "Filter – 50/50 Zone (45–55 Cent)",
-            "description": "Schlechteste Kalibrierung: bis zu 7% YES-Bias, kein Edge",
+            "name": "Filter – Range/Bracket-Kontrakte ausschließen",
+            "description": "Range-Kontrakte haben anderes Risikoprofil als Richtungswetten",
             "enabled": true,
-            "condition": { "type": "yes_ask_between", "threshold_low": 45, "threshold_high": 55 },
+            "condition": { "type": "title_not_contains", "value": "range" },
             "action": { "side": "SKIP" }
         },
         {
             "name": "Stark überschätztes YES (>90%) → NO kaufen",
-            "description": "~5% Overconfidence-Bias. Stärkster Edge, größte Position.",
+            "description": "~3–5% Overconfidence-Bias. Kelly-Sizing mit -2% Korrektur.",
             "enabled": true,
             "condition": { "type": "yes_ask_above", "threshold": 90 },
-            "action": { "side": "no", "order_type": "limit", "count": 5, "limit_offset_cents": 1 }
+            "action": {
+                "side": "no", "order_type": "limit", "limit_offset_cents": 1,
+                "kelly_sizing": true, "kelly_fraction": 0.25,
+                "min_count": 1, "max_count": 10
+            }
         },
         {
-            "name": "Leicht überschätztes YES (55–65%) → NO kaufen",
-            "description": "~1–2% Bias. Geringerer Edge → kleinere Position.",
+            "name": "Leicht überschätztes YES (58–70%) → NO kaufen",
+            "description": "~1–2% Bias. Kleinere Position, da Edge geringer.",
             "enabled": true,
-            "condition": { "type": "yes_ask_between", "threshold_low": 55, "threshold_high": 65 },
-            "action": { "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1 }
+            "condition": { "type": "yes_ask_between", "threshold_low": 58, "threshold_high": 70 },
+            "action": {
+                "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1
+            }
+        },
+        {
+            "name": "Gut kalibrierte Zone (73–82%) → YES kaufen (mind. 4h Restlaufzeit)",
+            "description": "Beste Kalibrierung laut Polymarket-Daten. NUR wenn > 4h verbleibend.",
+            "enabled": true,
+            "condition": {
+                "type": "yes_ask_between",
+                "threshold_low": 73,
+                "threshold_high": 82,
+                "min_hours_remaining": 4.0
+            },
+            "action": {
+                "side": "yes", "order_type": "limit", "count": 5, "limit_offset_cents": 1
+            }
         },
         {
             "name": "Time Decay – Überschätztes YES mit langer Laufzeit → NO",
-            "description": "Märkte mit 14+ Tagen Restlaufzeit und YES 18–62¢ verfallen tägl. ~0.2% wenn das Ereignis ausbleibt. Edge aus Strategy-6-Backtest: Zeit arbeitet systematisch gegen YES-Halter bei seltenen Ereignissen.",
+            "description": "Märkte mit 14+ Tagen: YES 18–62¢ verfällt tägl. ~0.2% wenn Ereignis ausbleibt.",
             "enabled": true,
             "condition": {
                 "type": "time_decay_no",
@@ -68,88 +107,92 @@
                 "yes_ask_max": 62
             },
             "action": { "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1 }
-        },
-        {
-            "name": "Gut kalibrierte Zone (73–82%) → YES kaufen",
-            "description": "Beste Kalibrierung laut Daten. Trend folgen.",
-            "enabled": true,
-            "condition": { "type": "yes_ask_between", "threshold_low": 73, "threshold_high": 82 },
-            "action": { "side": "yes", "order_type": "limit", "count": 5, "limit_offset_cents": 1 }
         }
     ],
 
-    "btc_ladder_rules": [
+    "crypto_scanner": {
+        "interval_seconds": 30,
+        "ladder_enabled": true,
+        "min15_enabled": true,
+        "min_volume_usd": 25,
+        "ladder_min_volume_usd": 100
+    },
+
+    "crypto_ladder_rules": [
         {
-            "name": "BTC-Leiter – Volumen-Filter $100",
-            "description": "Überspringt Stufen ohne Handelsaktivität",
+            "name": "Filter – Range/Bracket-Kontrakte ausschließen",
+            "description": "PFLICHT-FIX: Range-Kontrakte landen im Crypto-Track aber haben anderes Risikoprofil",
+            "enabled": true,
+            "condition": { "type": "title_not_contains", "value": "range" },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Filter – Mindest-Volumen $100",
             "enabled": true,
             "condition": { "type": "min_volume_usd", "threshold": 100 },
             "action": { "side": "SKIP" }
         },
         {
-            "name": "BTC-Leiter – 50/50 Zone (45–55 Cent) überspringen",
-            "description": "Kein Edge in der Unsicherheitszone",
+            "name": "Filter – 50/50-Zone (45–55¢)",
             "enabled": true,
             "condition": { "type": "yes_ask_between", "threshold_low": 45, "threshold_high": 55 },
             "action": { "side": "SKIP" }
         },
         {
-            "name": "BTC-Leiter – YES >90% → NO kaufen",
-            "description": "Stufe weit unter aktuellem BTC-Preis: fast sicher, aber Bias vorhanden. Kelly-Sizing mit Quarter-Kelly.",
+            "name": "Leiter – YES >85% → NO kaufen (Tail-Risiko wird unterschätzt)",
+            "description": "NUR wenn Spot > Schwelle + 1% UND > 2h verbleibend.",
             "enabled": true,
-            "condition": { "type": "yes_ask_above", "threshold": 90 },
+            "condition": {
+                "type": "yes_ask_above",
+                "threshold": 85,
+                "spot_min_overshoot_pct": 1.0,
+                "min_hours_remaining": 2.0
+            },
             "action": {
-                "side": "no", "order_type": "limit", "count": 5, "limit_offset_cents": 1,
-                "kelly_sizing": true, "kelly_fraction": 0.25, "min_count": 1, "max_count": 20
+                "side": "no", "order_type": "limit", "limit_offset_cents": 1,
+                "kelly_sizing": true, "kelly_fraction": 0.25,
+                "min_count": 1, "max_count": 15
             }
         },
         {
-            "name": "BTC-Leiter – YES 55–65% → NO kaufen",
-            "description": "Leicht überbewertet. Kelly-Sizing, kleinere Position da Edge geringer.",
+            "name": "Leiter – YES 73–82% → YES kaufen (RSI überverkauft + mind. 4h)",
+            "description": "NUR wenn RSI-Signal überverkauft UND > 4h verbleibend.",
             "enabled": true,
-            "condition": { "type": "yes_ask_between", "threshold_low": 55, "threshold_high": 65 },
+            "condition": {
+                "type": "yes_ask_between",
+                "threshold_low": 73,
+                "threshold_high": 82,
+                "min_hours_remaining": 4.0,
+                "require_rsi_oversold": true,
+                "rsi_oversold_threshold": 40
+            },
             "action": {
-                "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1,
-                "kelly_sizing": true, "kelly_fraction": 0.25, "min_count": 1, "max_count": 10
-            }
-        },
-        {
-            "name": "BTC-Leiter – YES 73–82% → YES kaufen",
-            "description": "Gut kalibrierte Zone. Kelly-Sizing auf Unterbewertung.",
-            "enabled": true,
-            "condition": { "type": "yes_ask_between", "threshold_low": 73, "threshold_high": 82 },
-            "action": {
-                "side": "yes", "order_type": "limit", "count": 5, "limit_offset_cents": 1,
-                "kelly_sizing": true, "kelly_fraction": 0.25, "min_count": 1, "max_count": 15
+                "side": "yes", "order_type": "limit", "count": 5, "limit_offset_cents": 1
             }
         }
     ],
 
-    "btc_15min_rules": [
+    "crypto_15min_rules": [
         {
-            "name": "BTC 15-Min – Volumen-Filter $1000",
-            "description": "Nur aktiv gehandelte Fenster",
+            "name": "15-Min – Mindest-Volumen $1000",
             "enabled": true,
             "condition": { "type": "min_volume_usd", "threshold": 1000 },
             "action": { "side": "SKIP" }
         },
         {
-            "name": "BTC 15-Min – Mean Reversion",
-            "description": "Faded Retail-Überreaktion nach starker BTC-Bewegung. Edge: Märkte überkorrigieren kurzfristig. Einstieg nur in frischen Fenstern (erste 5 Min).",
+            "name": "15-Min – Mean Reversion",
+            "description": "Faded Retail-Überreaktion. RSI-bestätigt. Kleinere Position (5ct statt 10ct).",
             "enabled": true,
             "condition": {
                 "type": "btc_15min_mean_reversion",
-                "change_threshold_pct": 0.3,
-                "bias_threshold": 0.65
+                "change_threshold_pct": 0.4,
+                "bias_threshold": 0.65,
+                "rsi_overbought": 68,
+                "rsi_oversold": 32
             },
-            "action": { "order_type": "limit", "count": 10, "limit_offset_cents": 1 }
+            "action": { "order_type": "limit", "count": 5, "limit_offset_cents": 1 }
         }
     ],
-
-    "risk": {
-        "max_position_usd": 50.0,
-        "max_total_exposure_usd": 200.0
-    },
 
     "logging": {
         "trades_file": "data/trades.jsonl",
