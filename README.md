@@ -14,7 +14,7 @@ Inklusive **Live-Dashboard** (React + Node.js) für Positionen, Settlements und 
 - **Dry-Run-Modus** mit persistenten In-Memory-Positionen
 - **Kelly-Criterion Positionsgröße** für Crypto-Ladder
 - **Auto-Settlement** mit P&L-Tracking und Gebührenberechnung
-- **Live-Dashboard** mit mobiler Optimierung
+- **Live-Dashboard** mit mobiler Optimierung, Positions-Filter und persistentem UI-Zustand
 
 ---
 
@@ -85,11 +85,11 @@ kalshi/
 
 Separates Docker-Image mit Node.js-Backend und React-Frontend:
 
-- **Aktive Wetten** – Gruppert nach Event mit Bildern, Laufzeiten, Preis-Bars
-- **Abgerechnete Trades** – Settlement-History mit P&L, horizontale Scroll-Tabelle
-- **System und Fehler** – Warnungen und Fehler aus `errors.jsonl`, immer sichtbar
+- **Aktive Wetten** – Sortiert nach Ablaufzeit, gruppiert in Kurzfristig / Mittelfristig / Langfristig, ein-/ausklappbar, Filterzustand wird in localStorage gespeichert
+- **Abgerechnete Trades** – Settlement-History mit P&L und vollem Grund-Text, horizontale Scroll-Tabelle
+- **System und Fehler** – Warnungen und Fehler aus `errors.jsonl`, immer sichtbar (grüner Hinweis wenn alles OK)
 - **Statistik-Panel** – Winrate, Gesamtexposure, bester/schlechtester Trade
-- **Mobil-optimiert** – Gestapelte Card-Ansicht für Tabellen auf kleinen Bildschirmen
+- **Mobil-optimiert** – Gestapelte Card-Ansicht für Tabellen auf Smartphones (≤ 480 px)
 
 ---
 
