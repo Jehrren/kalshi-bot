@@ -1,0 +1,15 @@
+services:
+  kalshi:
+    build: .
+    image: kalshi:local
+    container_name: kalshi
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

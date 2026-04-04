@@ -1,0 +1,34 @@
+# Secrets
+.env
+
+# Laufzeitdaten
+data/
+app/data/
+app/logs/
+bot.log
+*.log
+
+# Screenshots & Bilder (persönlich)
+*.jpg
+*.jpeg
+*.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Claude memory
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

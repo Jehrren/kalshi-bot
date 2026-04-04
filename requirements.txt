@@ -1,0 +1,8 @@
+aiohttp==3.11.18
+requests==2.32.3
+cryptography==44.0.2
+python-dotenv==1.1.0
+pandas==2.2.3
+numpy==2.2.3
+rich==13.9.4
+websockets==14.2

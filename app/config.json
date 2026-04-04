@@ -1,0 +1,147 @@
+{
+    "dry_run": true,
+
+    "settlement": {
+        "fee_pct": 1.0,
+        "delay_seconds": 300,
+        "starting_balance_usd": 200.0
+    },
+
+    "scanner": {
+        "interval_seconds": 30,
+        "btc_ladder_enabled": true,
+        "btc_15min_enabled": true,
+        "max_close_days": 30,
+        "categories": [
+            "economics", "financials", "politics", "elections", "companies",
+            "world", "health", "science and technology", "entertainment",
+            "social", "climate and weather", "transportation"
+        ],
+        "max_markets_per_scan": 200,
+        "min_volume_usd": 25
+    },
+
+    "rules": [
+        {
+            "name": "Filter – Mindest 24h-Volumen $100",
+            "description": "Eliminiert tote Märkte: hohe OI + kein Tagesvolumen = kein aktiver Counterparty",
+            "enabled": true,
+            "condition": { "type": "min_volume_usd", "threshold": 100 },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Filter – Mindest Open Interest $500",
+            "description": "Kein Markt ohne echtes gebundenes Kapital – sonst kein Fill möglich",
+            "enabled": true,
+            "condition": { "type": "min_open_interest_usd", "threshold": 500 },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Filter – 50/50 Zone (45–55 Cent)",
+            "description": "Schlechteste Kalibrierung: bis zu 7% YES-Bias, kein Edge",
+            "enabled": true,
+            "condition": { "type": "yes_ask_between", "threshold_low": 45, "threshold_high": 55 },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Stark überschätztes YES (>90%) → NO kaufen",
+            "description": "~5% Overconfidence-Bias. Stärkster Edge, größte Position.",
+            "enabled": true,
+            "condition": { "type": "yes_ask_above", "threshold": 90 },
+            "action": { "side": "no", "order_type": "limit", "count": 5, "limit_offset_cents": 1 }
+        },
+        {
+            "name": "Leicht überschätztes YES (55–65%) → NO kaufen",
+            "description": "~1–2% Bias. Geringerer Edge → kleinere Position.",
+            "enabled": true,
+            "condition": { "type": "yes_ask_between", "threshold_low": 55, "threshold_high": 65 },
+            "action": { "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1 }
+        },
+        {
+            "name": "Gut kalibrierte Zone (73–82%) → YES kaufen",
+            "description": "Beste Kalibrierung laut Daten. Trend folgen.",
+            "enabled": true,
+            "condition": { "type": "yes_ask_between", "threshold_low": 73, "threshold_high": 82 },
+            "action": { "side": "yes", "order_type": "limit", "count": 5, "limit_offset_cents": 1 }
+        }
+    ],
+
+    "btc_ladder_rules": [
+        {
+            "name": "BTC-Leiter – Volumen-Filter $100",
+            "description": "Überspringt Stufen ohne Handelsaktivität",
+            "enabled": true,
+            "condition": { "type": "min_volume_usd", "threshold": 100 },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "BTC-Leiter – 50/50 Zone (45–55 Cent) überspringen",
+            "description": "Kein Edge in der Unsicherheitszone",
+            "enabled": true,
+            "condition": { "type": "yes_ask_between", "threshold_low": 45, "threshold_high": 55 },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "BTC-Leiter – YES >90% → NO kaufen",
+            "description": "Stufe weit unter aktuellem BTC-Preis: fast sicher, aber Bias vorhanden. Kelly-Sizing mit Quarter-Kelly.",
+            "enabled": true,
+            "condition": { "type": "yes_ask_above", "threshold": 90 },
+            "action": {
+                "side": "no", "order_type": "limit", "count": 5, "limit_offset_cents": 1,
+                "kelly_sizing": true, "kelly_fraction": 0.25, "min_count": 1, "max_count": 20
+            }
+        },
+        {
+            "name": "BTC-Leiter – YES 55–65% → NO kaufen",
+            "description": "Leicht überbewertet. Kelly-Sizing, kleinere Position da Edge geringer.",
+            "enabled": true,
+            "condition": { "type": "yes_ask_between", "threshold_low": 55, "threshold_high": 65 },
+            "action": {
+                "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1,
+                "kelly_sizing": true, "kelly_fraction": 0.25, "min_count": 1, "max_count": 10
+            }
+        },
+        {
+            "name": "BTC-Leiter – YES 73–82% → YES kaufen",
+            "description": "Gut kalibrierte Zone. Kelly-Sizing auf Unterbewertung.",
+            "enabled": true,
+            "condition": { "type": "yes_ask_between", "threshold_low": 73, "threshold_high": 82 },
+            "action": {
+                "side": "yes", "order_type": "limit", "count": 5, "limit_offset_cents": 1,
+                "kelly_sizing": true, "kelly_fraction": 0.25, "min_count": 1, "max_count": 15
+            }
+        }
+    ],
+
+    "btc_15min_rules": [
+        {
+            "name": "BTC 15-Min – Volumen-Filter $1000",
+            "description": "Nur aktiv gehandelte Fenster",
+            "enabled": true,
+            "condition": { "type": "min_volume_usd", "threshold": 1000 },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "BTC 15-Min – Mean Reversion",
+            "description": "Faded Retail-Überreaktion nach starker BTC-Bewegung. Edge: Märkte überkorrigieren kurzfristig. Einstieg nur in frischen Fenstern (erste 5 Min).",
+            "enabled": true,
+            "condition": {
+                "type": "btc_15min_mean_reversion",
+                "change_threshold_pct": 0.3,
+                "bias_threshold": 0.65
+            },
+            "action": { "order_type": "limit", "count": 10, "limit_offset_cents": 1 }
+        }
+    ],
+
+    "risk": {
+        "max_position_usd": 50.0,
+        "max_total_exposure_usd": 200.0
+    },
+
+    "logging": {
+        "trades_file": "data/trades.jsonl",
+        "signals_file": "data/signals.jsonl",
+        "errors_file": "data/errors.jsonl"
+    }
+}
