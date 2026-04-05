@@ -15,6 +15,7 @@ Bedingungstypen:
   min_volume_usd      : SKIP-Filter
   min_open_interest_usd: SKIP-Filter
   title_not_contains  : SKIP-Filter
+  ticker_not_contains : SKIP-Filter (prüft Ticker-String, z.B. "-B" für Bracket)
 """
 
 import logging
@@ -126,6 +127,11 @@ class PredictionRuleEngine:
                 keyword = str(cond.get("value", "")).lower()
                 if keyword in title:
                     logger.debug(f"[Prediction] {ticker} SKIP – Titel enthält '{keyword}'")
+                    return []
+            if t == "ticker_not_contains":
+                fragment = str(cond.get("value", "")).upper()
+                if fragment in ticker.upper():
+                    logger.debug(f"[Prediction] {ticker} SKIP – Ticker enthält '{fragment}'")
                     return []
             if t == "yes_ask_between":
                 low  = int(cond.get("threshold_low", 0))

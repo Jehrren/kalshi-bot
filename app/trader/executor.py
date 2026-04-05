@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 _TRACK_SCORES: dict[str, float] = {
     "crypto_15min": 1.00,  # Mean-Reversion, 10–15 Min Restlaufzeit
     "crypto":       0.80,  # BTC/ETH Tages-Leiter
-    "arb":          0.70,  # Leiter-Arbitrage
+    "arb":          0.75,  # Leiter-Arbitrage (echte Preisumkehr)
+    "pred_zone":    0.72,  # Prediction-Ladder Zone-Bet (garantierter Edge ohne vol_ratio)
+    "zone":         0.70,  # Zone/Spread-Bet (Niedrig-Vol Edge)
     "politisch":    0.50,  # Politische/wirtschaftliche Märkte
 }
 
@@ -48,6 +50,11 @@ class TradeExecutor:
         self._min_score   = float(p_cfg.get("min_score", 0.30))
         self._max_signals = int(p_cfg.get("max_signals_per_cycle", 10))
 
+        # Lock: macht check_order_allowed + record_order atomar (Dry-Run-Pfad).
+        # Signale werden sequenziell über die Queue verarbeitet (single-consumer).
+        # Lock schützt nur gegen theoretische Interleaving-Szenarien bei zukünftiger
+        # Parallelisierung. Im Live-Pfad wird Lock vor API-Call freigegeben.
+        self._order_lock = asyncio.Lock()
         if self._dry_run:
             logger.info("[Executor] *** DRY-RUN MODUS – keine echten Orders ***")
 
@@ -203,69 +210,72 @@ class TradeExecutor:
             await self._execute_exit(signal)
             return
 
-        self._risk.refresh_positions()
-
-        # System-Tag aus Meta lesen
         system = signal.meta.get("system", "")
 
-        allowed, reason = self._risk.check_order_allowed(
-            signal.ticker, signal.count, signal.price_cents, system=system
-        )
-        if not allowed:
-            logger.debug(f"[Executor] Abgelehnt | {signal.ticker}: {reason}")
-            # Normale Risk-Limits (kein Fehler, nur Kapital/Positionen erschöpft)
-            _expected = ("Bereits positioniert", "Max-Position", "Max-Exposure",
-                         "System-Budget", "Max. offene Positionen")
-            if not any(reason.startswith(p) for p in _expected):
-                self._logger.log_error("RiskBlock", reason, extra={"ticker": signal.ticker})
-            return
-
-        logger.info(
-            f"[Executor] {'[DRY] ' if self._dry_run else ''}Order | "
-            f"[{system or '?'}] {signal.ticker} {signal.action} {signal.side} "
-            f"{signal.count}x @ {signal.price_cents}¢ | {signal.rule_name}"
-        )
-
-        if self._dry_run:
-            self._logger.log_trade(
-                ticker=signal.ticker,
-                side=signal.side,
-                price_cents=signal.price_cents,
-                count=signal.count,
-                order_id="DRY_RUN",
-                status="dry_run",
-                rule_name=signal.rule_name,
-                extra={
-                    "reason":     signal.reason,
-                    "dry_run":    True,
-                    "close_time": signal.meta.get("close_time", ""),
-                    "title":      signal.meta.get("title", ""),
-                    "system":     system,
-                },
+        # Lock: atomare Sequenz aus check → (record | order+record)
+        async with self._order_lock:
+            self._risk.refresh_positions()
+            allowed, reason = self._risk.check_order_allowed(
+                signal.ticker, signal.count, signal.price_cents,
+                system=system,
+                event_ticker=signal.meta.get("event_ticker", ""),
             )
-            # Simulierte Position verbuchen – verhindert Duplikate in Folge-Zyklen
-            self._risk.record_order(
-                signal.ticker, signal.count, signal.price_cents, True,
-                close_time  = signal.meta.get("close_time", ""),
-                side        = signal.side,
-                rule_name   = signal.rule_name,
-                title       = signal.meta.get("title", ""),
-                event_title = signal.meta.get("event_title", ""),
-                reason      = signal.reason,
-                category    = signal.meta.get("category", ""),
-                event_ticker= signal.meta.get("event_ticker", ""),
-                sub_title   = signal.meta.get("sub_title", ""),
-                image_url   = signal.meta.get("image_url", ""),
-                system      = system,
-            )
-            summary = self._risk.get_summary()
+            if not allowed:
+                logger.debug(f"[Executor] Abgelehnt | {signal.ticker}: {reason}")
+                _expected = ("Bereits positioniert", "Max-Position", "Max-Exposure",
+                             "System-Budget", "System-Limit", "Event-Ticker Duplikat",
+                             "Max. offene Positionen")
+                if not any(reason.startswith(p) for p in _expected):
+                    self._logger.log_error("RiskBlock", reason, extra={"ticker": signal.ticker})
+                return
+
             logger.info(
-                f"[Executor/DryRun] Positionen: {summary['open_positions']} | "
-                f"Exposure: ${summary['total_exposure_usd']:.2f} / "
-                f"${self._risk.max_total_exposure_usd:.0f}"
+                f"[Executor] {'[DRY] ' if self._dry_run else ''}Order | "
+                f"[{system or '?'}] {signal.ticker} {signal.action} {signal.side} "
+                f"{signal.count}x @ {signal.price_cents}¢ | {signal.rule_name}"
             )
-            return
 
+            if self._dry_run:
+                self._logger.log_trade(
+                    ticker=signal.ticker,
+                    side=signal.side,
+                    price_cents=signal.price_cents,
+                    count=signal.count,
+                    order_id="DRY_RUN",
+                    status="dry_run",
+                    rule_name=signal.rule_name,
+                    extra={
+                        "reason":     signal.reason,
+                        "dry_run":    True,
+                        "close_time": signal.meta.get("close_time", ""),
+                        "title":      signal.meta.get("title", ""),
+                        "system":     system,
+                    },
+                )
+                # Simulierte Position verbuchen – verhindert Duplikate in Folge-Zyklen
+                self._risk.record_order(
+                    signal.ticker, signal.count, signal.price_cents, True,
+                    close_time  = signal.meta.get("close_time", ""),
+                    side        = signal.side,
+                    rule_name   = signal.rule_name,
+                    title       = signal.meta.get("title", ""),
+                    event_title = signal.meta.get("event_title", ""),
+                    reason      = signal.reason,
+                    category    = signal.meta.get("category", ""),
+                    event_ticker= signal.meta.get("event_ticker", ""),
+                    sub_title   = signal.meta.get("sub_title", ""),
+                    image_url   = signal.meta.get("image_url", ""),
+                    system      = system,
+                )
+                summary = self._risk.get_summary()
+                logger.info(
+                    f"[Executor/DryRun] Positionen: {summary['open_positions']} | "
+                    f"Exposure: ${summary['total_exposure_usd']:.2f} / "
+                    f"${self._risk.max_total_exposure_usd:.0f}"
+                )
+                return
+
+        # Live-Pfad: Lock vor API-Call freigeben (kann Sekunden dauern)
         loop = asyncio.get_running_loop()
         try:
             result = await loop.run_in_executor(
@@ -288,8 +298,22 @@ class TradeExecutor:
         order_id = order.get("id")
         status   = order.get("status", "unknown")
 
-        if status in ("resting", "filled", "partially_filled"):
-            self._risk.record_order(signal.ticker, signal.count, signal.price_cents, True)
+        async with self._order_lock:
+            if status in ("resting", "filled", "partially_filled"):
+                self._risk.record_order(
+                    signal.ticker, signal.count, signal.price_cents, True,
+                    close_time  = signal.meta.get("close_time", ""),
+                    side        = signal.side,
+                    rule_name   = signal.rule_name,
+                    title       = signal.meta.get("title", ""),
+                    event_title = signal.meta.get("event_title", ""),
+                    reason      = signal.reason,
+                    category    = signal.meta.get("category", ""),
+                    event_ticker= signal.meta.get("event_ticker", ""),
+                    sub_title   = signal.meta.get("sub_title", ""),
+                    image_url   = signal.meta.get("image_url", ""),
+                    system      = system,
+                )
 
         self._logger.log_trade(
             ticker=signal.ticker,

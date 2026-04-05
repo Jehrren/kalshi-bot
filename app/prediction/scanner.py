@@ -76,6 +76,14 @@ class PredictionScanner:
         self._exchange_trading:     bool    = True
         self._last_exchange_check:  float   = 0.0
 
+        self._zone_on               = bool(scan_cfg.get("zone_enabled", False))
+        self._zone_max_combined     = int(scan_cfg.get("zone_max_combined_cents", 95))
+        self._zone_min_hours        = float(scan_cfg.get("zone_min_hours_remaining", 3.0))
+        self._zone_count            = int(scan_cfg.get("zone_count", 3))
+        self._zone_yes_min          = int(scan_cfg.get("zone_yes_leg_min", 55))
+        self._zone_yes_max          = int(scan_cfg.get("zone_yes_leg_max", 88))
+        self._zone_no_ya_min        = int(scan_cfg.get("zone_no_yes_ask_min", 85))
+
         logger.info(
             f"[Prediction/Scanner] Gestartet | Intervall: {self._interval_s}s | "
             f"Budget: ${self._bankroll:.0f}"
@@ -120,8 +128,23 @@ class PredictionScanner:
         if not self._exchange_trading:
             return
 
+        events = await self._fetch_events(loop)
+
+        # Positions-State einmal laden und an Sub-Scans durchreichen
+        active_event_tickers: set[str] = set()
+        try:
+            pos_data = json.loads(Path("data/positions.json").read_text())
+            for p in pos_data.get("positions", []):
+                et_pos = p.get("event_ticker", "")
+                if et_pos:
+                    active_event_tickers.add(et_pos)
+        except Exception:
+            pass
+
         signals_total = 0
-        signals_total += await self._scan_entries(loop)
+        signals_total += await self._scan_entries(loop, events, active_event_tickers)
+        if self._zone_on:
+            signals_total += await self._scan_zone_pairs(events, active_event_tickers)
         signals_total += await self._scan_exits(loop)
 
         if signals_total:
@@ -132,20 +155,25 @@ class PredictionScanner:
         if self._on_cycle_end:
             await self._on_cycle_end()
 
-    # ── Entry-Scan ───────────────────────────────────────────────────── #
+    # ── Event-Fetch ──────────────────────────────────────────────────── #
 
-    async def _scan_entries(self, loop) -> int:
+    async def _fetch_events(self, loop) -> list:
+        """Holt alle offenen Events gefiltert nach konfigurierten Kategorien."""
         events = await loop.run_in_executor(
             None,
             lambda: self._client.get_all_events(status="open", with_nested_markets=True),
         )
-        allowed = [e for e in events if (e.get("category") or "").lower() in self._categories]
+        return [e for e in events if (e.get("category") or "").lower() in self._categories]
 
+    # ── Entry-Scan ───────────────────────────────────────────────────── #
+
+    async def _scan_entries(self, loop, events: list,
+                            active_event_tickers: set[str]) -> int:
         markets: list[dict] = []
         now_utc  = datetime.now(timezone.utc)
         max_secs = (self._max_close_days or 30) * 86400
 
-        for event in allowed:
+        for event in events:
             series_ticker = (event.get("series_ticker") or "").upper()
             image_url     = (event.get("image_url") or "").strip()
             event_title   = (event.get("title") or "").strip()
@@ -168,10 +196,11 @@ class PredictionScanner:
                 if self._min_volume > 0:
                     if float(m.get("volume_24h_fp", 0) or 0) < self._min_volume:
                         continue
-                m["category"]    = (event.get("category") or "").lower()
-                m["sub_title"]   = (event.get("sub_title") or "").strip()
-                m["image_url"]   = image_url
-                m["event_title"] = event_title
+                m["category"]     = (event.get("category") or "").lower()
+                m["sub_title"]    = (event.get("sub_title") or "").strip()
+                m["image_url"]    = image_url
+                m["event_title"]  = event_title
+                m["event_ticker"] = event.get("event_ticker", "")
                 markets.append(m)
 
         logger.info(f"[Prediction/Scanner] {len(markets)} Märkte gescannt")
@@ -179,6 +208,11 @@ class PredictionScanner:
         signals = 0
         for market in markets:
             ticker = market.get("ticker", "")
+
+            # Event-Ticker Dedup: max. 1 Position pro Event (verhindert Range-Exposure)
+            et_mkt = market.get("event_ticker", "")
+            if et_mkt and et_mkt in active_event_tickers:
+                continue
 
             # Überreaktions-Delta berechnen und ins market-Dict injizieren
             ya_raw = market.get("yes_ask_dollars") or market.get("yes_ask")
@@ -203,6 +237,162 @@ class PredictionScanner:
             for ps in self._rules.evaluate(market, bankroll_usd=self._bankroll):
                 await self._on_signal(_to_executor_signal(ps))
                 signals += 1
+        return signals
+
+    # ── Zone-Bet-Scan ────────────────────────────────────────────────── #
+
+    async def _scan_zone_pairs(self, events: list,
+                               active_event_tickers: set[str]) -> int:
+        """
+        Zone-Bet für Prediction-Ladder-Märkte (Gas, CPI, etc.).
+        Kauft YES am unteren + NO am oberen Schwellenwert desselben Events.
+        Edge: combined_cost < 95¢ → in allen Szenarien profitabel (kein vol_ratio nötig).
+
+          Szenario A (Preis in Zone):           beide lösen aus → +200 − combined
+          Szenario B (Preis außerhalb Zone):    ein Leg löst aus  → +100 − combined
+        """
+        now_utc  = datetime.now(timezone.utc)
+        min_secs = self._zone_min_hours * 3600
+
+        def _price(m: dict, key: str) -> Optional[int]:
+            v = m.get(key + "_dollars") or m.get(key)
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return int(round(f * 100)) if f <= 1.0 else int(round(f))
+            except (ValueError, TypeError):
+                return None
+
+        signals = 0
+        for event in events:
+            et = event.get("event_ticker", "")
+            if not et:
+                continue
+
+            # Bereits aktive Positionen in diesem Event → überspringen
+            if et in active_event_tickers:
+                continue
+
+            raw_markets = [
+                m for m in event.get("markets", [])
+                if m.get("status", "active") in ("active", "open")
+            ]
+            if len(raw_markets) < 2:
+                continue
+
+            # Zeitfilter + Preise lesen: (market, yes_ask, no_ask)
+            valid: list[tuple[dict, int, int]] = []
+            for m in raw_markets:
+                ct_str = m.get("close_time", "")
+                if not ct_str:
+                    continue
+                try:
+                    ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
+                    if (ct - now_utc).total_seconds() < min_secs:
+                        continue
+                except Exception:
+                    continue
+                ya = _price(m, "yes_ask")
+                na = _price(m, "no_ask")
+                if ya is not None and na is not None:
+                    valid.append((m, ya, na))
+
+            if len(valid) < 2:
+                continue
+
+            # Aufsteigend nach yes_ask sortieren:
+            # niedrigster YES-Ask (= höchster Schwellenwert, weit über Spot) zuerst,
+            # höchster YES-Ask (= niedrigster Schwellenwert, tief im Geld) zuletzt.
+            valid.sort(key=lambda x: x[1])
+
+            # Suche erstes gültiges Paar: m_high hat hohen YES-Ask (YES-Leg),
+            # m_low hat niedrigen YES-Ask → teueren NO (NO-Leg).
+            for i in range(len(valid) - 1):
+                m_no_leg,  ya_no_leg,  na_no_leg  = valid[i]      # hoher Schwellenwert, niedriger YES
+                m_yes_leg, ya_yes_leg, na_yes_leg = valid[i + 1]  # niedriger Schwellenwert, hoher YES
+
+                # YES-Leg: YES-Ask muss im konfigurierten Preisfenster liegen
+                if not (self._zone_yes_min <= ya_yes_leg <= self._zone_yes_max):
+                    continue
+                # NO-Leg: YES-Ask muss hoch genug sein (= NO-Preis ist günstig)
+                # Nein: das NO-Leg hat den NIEDRIGEREN YES-Ask → dessen NO ist teuer.
+                # Korrektur: NO-Leg = m_no_leg (hoher Schwellenwert).
+                # Dessen YES-Ask ist niedrig → NO-Ask = na_no_leg (direkt lesen!).
+                # Wir wollen: YES-Ask des NO-Legs ≥ zone_no_ya_min (damit NO günstig)
+                # → aber m_no_leg hat den niedrigsten YES-Ask. Das passt nicht.
+                # Richtige Logik: m_yes_leg ist das YES-Kauf-Leg (hoher YES-Ask),
+                # m_no_leg ist das NO-Kauf-Leg (dessen YES ist hoch → NO günstig).
+                # → m_no_leg.yes_ask sollte ≥ zone_no_ya_min sein.
+                # Aber bei aufsteigender Sortierung hat valid[i] den niedrigeren YES.
+                # Also: valid[-1] hat den höchsten YES (= YES-Kauf-Leg),
+                # valid[-2] hat den zweithöchsten YES (= NO-Kauf-Leg, dessen YES ≥ 85).
+                # Wir iterieren von unten: i und i+1 benachbart.
+                # valid[i+1] hat höheren YES → YES-Leg.
+                # valid[i] hat niedrigeren YES → NO-Leg (dessen YES muss ≥ 85 sein für günstiges NO)
+                if ya_no_leg < self._zone_no_ya_min:
+                    continue
+
+                # Kosten: actual prices + 1¢ Slippage
+                cost_yes = ya_yes_leg + 1
+                cost_no  = na_no_leg + 1
+                combined = cost_yes + cost_no
+
+                if combined >= self._zone_max_combined:
+                    continue
+
+                ticker_yes = m_yes_leg.get("ticker", "")
+                ticker_no  = m_no_leg.get("ticker", "")
+                if not ticker_yes or not ticker_no:
+                    continue
+
+                logger.info(
+                    f"[Prediction/ZoneBet] {et}: "
+                    f"YES@{ticker_yes}({ya_yes_leg}¢) + NO@{ticker_no}(no_ask={na_no_leg}¢) "
+                    f"→ combined={combined}¢ (max={self._zone_max_combined}¢)"
+                )
+
+                zone_meta_base = {
+                    "system":        SYSTEM,
+                    "combined_cost": combined,
+                    "event_ticker":  et,
+                }
+
+                sig_yes = _to_executor_signal(PredictionSignal(
+                    ticker      = ticker_yes,
+                    rule_name   = "ZoneBet:YES",
+                    side        = "yes",
+                    action      = "buy",
+                    price_cents = cost_yes,
+                    count       = self._zone_count,
+                    reason      = (
+                        f"ZoneBet YES leg | combined={combined}¢ < "
+                        f"{self._zone_max_combined}¢ | pair={ticker_no}"
+                    ),
+                    meta        = {**zone_meta_base, "zone_pair": ticker_no},
+                    track       = "pred_zone",
+                ))
+                sig_no = _to_executor_signal(PredictionSignal(
+                    ticker      = ticker_no,
+                    rule_name   = "ZoneBet:NO",
+                    side        = "no",
+                    action      = "buy",
+                    price_cents = cost_no,
+                    count       = self._zone_count,
+                    reason      = (
+                        f"ZoneBet NO leg | combined={combined}¢ < "
+                        f"{self._zone_max_combined}¢ | pair={ticker_yes}"
+                    ),
+                    meta        = {**zone_meta_base, "zone_pair": ticker_yes},
+                    track       = "pred_zone",
+                ))
+
+                # Beide Legs zusammen senden — Executor prüft beide atomar
+                await self._on_signal(sig_yes)
+                await self._on_signal(sig_no)
+                signals += 2
+                break   # Nur 1 Paar pro Event
+
         return signals
 
     # ── Exit-Scan ────────────────────────────────────────────────────── #

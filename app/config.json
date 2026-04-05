@@ -12,13 +12,15 @@
             "enabled": true,
             "max_exposure_usd": 80.0,
             "max_position_usd": 20.0,
-            "max_open_positions": 15
+            "max_open_positions": 15,
+            "max_positions_per_event": 2
         },
         "crypto": {
             "enabled": true,
             "max_exposure_usd": 80.0,
             "max_position_usd": 20.0,
-            "max_open_positions": 10
+            "max_open_positions": 10,
+            "max_positions_per_event": 2
         }
     },
 
@@ -27,6 +29,13 @@
         "max_close_days": 30,
         "min_volume_usd": 100,
         "overreaction_delta_cents": 8,
+        "zone_enabled": true,
+        "zone_max_combined_cents": 95,
+        "zone_min_hours_remaining": 3.0,
+        "zone_count": 3,
+        "zone_yes_leg_min": 55,
+        "zone_yes_leg_max": 88,
+        "zone_no_yes_ask_min": 85,
         "categories": [
             "economics", "financials", "politics", "elections", "companies",
             "world", "health", "science and technology", "entertainment",
@@ -35,6 +44,13 @@
     },
 
     "prediction_rules": [
+        {
+            "name": "Filter – Bracket/Between-Kontrakte ausschließen",
+            "description": "Ticker mit '-B' gefolgt von Zahl sind Bracket-Kontrakte (z.B. -B73.5) – anderes Risikoprofil",
+            "enabled": true,
+            "condition": { "type": "ticker_not_contains", "value": "-B" },
+            "action": { "side": "SKIP" }
+        },
         {
             "name": "Filter – 50/50-Zone (43–57¢)",
             "description": "Schlechteste Kalibrierung: bis zu 7% YES-Bias, kein Edge",
@@ -130,6 +146,7 @@
         "interval_seconds": 30,
         "ladder_enabled": true,
         "min15_enabled": true,
+        "min15_series": ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M", "KXDOGE15M", "KXBNB15M"],
         "min_volume_usd": 100,
         "min_volume_by_series": {
             "KXBTCD": 1000,
@@ -141,7 +158,9 @@
             "KXHYPE": 0,
             "KXSHIBA": 0
         },
-        "max_concurrent_per_asset": 2
+        "max_concurrent_per_asset": 2,
+        "max_concurrent_per_event": 2,
+        "zone_enabled": true
     },
 
     "crypto_ladder_rules": [
@@ -172,7 +191,8 @@
                 "type": "yes_ask_above",
                 "threshold": 85,
                 "spot_min_overshoot_pct": 1.0,
-                "min_hours_remaining": 2.0
+                "min_hours_remaining": 2.0,
+                "max_hours_remaining": 168
             },
             "action": {
                 "side": "no", "order_type": "limit", "limit_offset_cents": 1,
@@ -189,6 +209,7 @@
                 "threshold_low": 73,
                 "threshold_high": 82,
                 "min_hours_remaining": 4.0,
+                "max_hours_remaining": 168,
                 "require_rsi_oversold": true,
                 "rsi_oversold_threshold": 40
             },
@@ -201,7 +222,8 @@
     "crypto_15min_rules": [
         {
             "name": "15-Min – Mindest-Volumen $1000",
-            "enabled": true,
+            "description": "DEAKTIVIERT: volume_24h_fp ist für 15M-Märkte immer 0 (Markt existiert nur 15 Min). Filter würde alle Märkte blocken.",
+            "enabled": false,
             "condition": { "type": "min_volume_usd", "threshold": 1000 },
             "action": { "side": "SKIP" }
         },
@@ -218,6 +240,31 @@
                 "vol_ratio_min": 1.1
             },
             "action": { "order_type": "limit", "count": 5, "limit_offset_cents": 1 }
+        }
+    ],
+
+    "crypto_zone_rules": [
+        {
+            "name": "Zone-Bet – Niedrig-Vol Bereich",
+            "description": "YES auf untere Schwelle + NO auf obere Schwelle. Edge wenn vol_ratio < 0.8. combined ≤ 95¢ → alle Szenarien profitabel. Aktiv ab 3h Restlaufzeit.",
+            "enabled": true,
+            "condition": {
+                "type": "zone_bet",
+                "yes_leg_min": 55,
+                "yes_leg_max": 88,
+                "no_yes_ask_min": 85,
+                "no_yes_ask_max": 98,
+                "max_combined_cost_cents": 95,
+                "max_vol_ratio": 0.8,
+                "rsi_neutral_min": 35,
+                "rsi_neutral_max": 65,
+                "min_hours_remaining": 3.0
+            },
+            "action": {
+                "order_type": "limit",
+                "count": 3,
+                "limit_offset_cents": 1
+            }
         }
     ],
 

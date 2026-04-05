@@ -24,7 +24,7 @@ from typing import Callable, Optional
 
 from api.client import KalshiClient
 from api.ws_client import KalshiWSFeed
-from crypto.rules import CryptoLadderRuleEngine, Crypto15MinRuleEngine, CryptoSignal
+from crypto.rules import CryptoLadderRuleEngine, Crypto15MinRuleEngine, CryptoZoneRuleEngine, CryptoSignal
 from feeds.bingx_feed import BingXFeed, SERIES_SYMBOL_MAP, series_to_symbol
 from logger.trade_logger import TradeLogger
 from trader.executor import Signal
@@ -77,13 +77,17 @@ class CryptoScanner:
         self._min15_on    = bool(scan_cfg.get("min15_enabled", True))
         self._min_vol            = float(scan_cfg.get("min_volume_usd", 25))
         self._min_vol_by_series  = dict(scan_cfg.get("min_volume_by_series", {}))
-        self._max_concurrent     = int(scan_cfg.get("max_concurrent_per_asset", 2))
+        self._max_concurrent      = int(scan_cfg.get("max_concurrent_per_asset", 2))
+        self._max_concurrent_event = int(scan_cfg.get("max_concurrent_per_event", 2))
+        self._zone_on             = bool(scan_cfg.get("zone_enabled", True))
+        self._min15_series        = list(scan_cfg.get("min15_series", []))
 
         sys_cfg           = config.get("systems", {}).get(SYSTEM, {})
         self._bankroll    = float(sys_cfg.get("max_exposure_usd", 80.0))
 
         self._ladder_rules = CryptoLadderRuleEngine(config)
         self._min15_rules  = Crypto15MinRuleEngine(config)
+        self._zone_rules   = CryptoZoneRuleEngine(config)
 
         self._ws_feed: Optional[KalshiWSFeed] = None
         if self._min15_on:
@@ -160,9 +164,26 @@ class CryptoScanner:
         for feed in self._bingx_feeds.values():
             await loop.run_in_executor(None, feed.refresh)
 
+        # Positions-State einmal laden und an alle Sub-Scans durchreichen
+        cross_blocked_events: set[str]       = set()
+        crypto_event_count:   dict[str, int] = defaultdict(int)
+        try:
+            pos_data = json.loads(Path("data/positions.json").read_text())
+            for p in pos_data.get("positions", []):
+                et_pos = p.get("event_ticker", "")
+                if et_pos:
+                    if p.get("system") == SYSTEM:
+                        crypto_event_count[et_pos] += 1
+                    else:
+                        cross_blocked_events.add(et_pos)
+        except Exception:
+            pass
+
         if self._ladder_on:
-            signals += await self._scan_ladder(loop)
+            signals += await self._scan_ladder(loop, cross_blocked_events, crypto_event_count)
             signals += await self._scan_arb(loop)
+            if self._zone_on:
+                signals += await self._scan_zone(loop, cross_blocked_events, crypto_event_count)
 
         signals += await self._scan_exits(loop)
 
@@ -176,7 +197,9 @@ class CryptoScanner:
 
     # ── Track A: Tages-Leiter ─────────────────────────────────────────── #
 
-    async def _scan_ladder(self, loop) -> int:
+    async def _scan_ladder(self, loop,
+                           cross_blocked_events: set[str],
+                           crypto_event_count: dict[str, int]) -> int:
         bankroll_usd = self._bankroll
 
         sym_ctxs: dict[str, dict] = {}
@@ -202,6 +225,28 @@ class CryptoScanner:
 
         crypto_events = await loop.run_in_executor(None, self._client.get_all_crypto_events)
         if not crypto_events:
+            crypto_events = []
+
+        # 15M-Series werden von get_all_crypto_events() nicht zurückgegeben →
+        # explizit per series_ticker abfragen (konfigurierbar in crypto_scanner.min15_series)
+        if self._min15_on and self._min15_series:
+            for series_ticker in self._min15_series:
+                try:
+                    min15_evs = await loop.run_in_executor(
+                        None,
+                        lambda s=series_ticker: self._client.get_events(
+                            series_ticker=s, with_nested_markets=True, status="open"
+                        ),
+                    )
+                    if min15_evs:
+                        crypto_events.extend(min15_evs)
+                        logger.info(
+                            f"[Crypto/Scanner] {series_ticker}: {len(min15_evs)} 15M-Event(s) geladen"
+                        )
+                except Exception as e:
+                    logger.debug(f"[Crypto/Scanner] 15M-Fetch {series_ticker} fehlgeschlagen: {e}")
+
+        if not crypto_events:
             return 0
 
         now            = datetime.now(timezone.utc)
@@ -210,11 +255,14 @@ class CryptoScanner:
         active_15m_tickers: set[str] = set()
         self._ladder_event_tickers = []
 
+        # Volumen-Schwellenwert aus aktivierten 15M-Regeln ermitteln.
+        # HINWEIS: volume_24h_fp ist für 15M-Märkte immer 0 (Markt lebt nur 15 Min).
+        # Deshalb ist die Mindest-Volumen-Regel standardmäßig deaktiviert → default 0.
         min15_vol = float(next(
-            (r["condition"].get("threshold", 1000)
+            (r["condition"].get("threshold", 0)
              for r in self._config.get("crypto_15min_rules", [])
-             if r.get("condition", {}).get("type") == "min_volume_usd"),
-            1000,
+             if r.get("enabled", True) and r.get("condition", {}).get("type") == "min_volume_usd"),
+            0,
         ))
 
         for ev in crypto_events:
@@ -230,9 +278,10 @@ class CryptoScanner:
             for m in ev.get("markets", []):
                 if m.get("status", "active") not in ("active", "open"):
                     continue
-                m["_series"]     = series
-                m["category"]    = "crypto"
-                m["event_title"] = (ev.get("title") or "").strip()
+                m["_series"]      = series
+                m["category"]     = "crypto"
+                m["event_title"]  = (ev.get("title") or "").strip()
+                m["event_ticker"] = et
                 if not m.get("image_url"):
                     m["image_url"] = (ev.get("image_url") or "").strip()
 
@@ -247,10 +296,14 @@ class CryptoScanner:
                             continue
                     except Exception:
                         continue
-                    if float(m.get("volume_24h_fp", 0) or 0) >= min15_vol:
-                        active_15m_tickers.add(m.get("ticker", ""))
-                        min15_markets.append(m)
+                    vol = float(m.get("volume_24h_fp", 0) or 0)
+                    if min15_vol > 0 and vol < min15_vol:
+                        continue
+                    active_15m_tickers.add(m.get("ticker", ""))
+                    min15_markets.append(m)
                 else:
+                    if series not in _LADDER_SERIES:
+                        continue
                     vol            = float(m.get("volume_24h_fp", 0) or 0)
                     series_min_vol = self._min_vol_by_series.get(series, self._min_vol)
                     if vol < series_min_vol:
@@ -264,7 +317,10 @@ class CryptoScanner:
                         if thr > 0:
                             change_abs   = abs(spot_ctx.get("btc_change_15min", 0) or 0)
                             adaptive_pct = 2.0 + min(change_abs * 0.5, 2.0)
-                            lo = spot_p * (1 - adaptive_pct / 100)
+                            # Asymmetrischer Filter:
+                            # – 5% unter Spot: erfasst YES>85¢-Zone (threshold 2–5% unter Spot)
+                            # – adaptiv über Spot: verhindert hoffnungslos niedrige YES-Preise
+                            lo = spot_p * (1 - 5.0 / 100)
                             hi = spot_p * (1 + adaptive_pct / 100)
                             if not (lo <= thr <= hi):
                                 continue
@@ -277,7 +333,7 @@ class CryptoScanner:
         # Nach Volumen sortieren – höchste Liquidität zuerst
         markets.sort(key=lambda m: float(m.get("volume_24h_fp", 0) or 0), reverse=True)
 
-        # Positionen laden: Concurrent-Limit + Cross-Track-Hedge
+        # Concurrent-Limit + Cross-Track-Hedge aus positions.json (bereits geladen)
         concurrent_by_series: dict[str, int] = defaultdict(int)
         active_15m_symbols:   set[str]       = set()
         try:
@@ -295,25 +351,69 @@ class CryptoScanner:
         except Exception:
             pass
 
-        logger.info(f"[Crypto/Scanner] {len(markets)} Leiter-Märkte")
+        # Per-Serie Aufschlüsselung + Feed-Status
+        series_counts: dict[str, int] = defaultdict(int)
+        for m in markets:
+            series_counts[m.get("_series", "?")] += 1
+        feed_info = " | ".join(
+            f"{sym.split('-')[0]}={feed.current_price() or '?'}"
+            for sym, feed in self._bingx_feeds.items()
+            if feed.is_ready()
+        )
+        logger.info(
+            f"[Crypto/Scanner] {len(markets)} Leiter-Märkte | "
+            + " ".join(f"{s}:{n}" for s, n in sorted(series_counts.items()))
+            + (f" | Feeds: {feed_info}" if feed_info else " | Feeds: nicht bereit")
+        )
 
         signals = 0
+        signals_by_series: dict[str, int] = defaultdict(int)
+        skipped_concurrent = skipped_event = skipped_hedge = 0
+
         for market in markets:
             series_key = market.get("_series", "")
             sym        = series_to_symbol(series_key) or "BTC-USDT"
 
             # Concurrent-Limit: max. N offene Positionen pro Serie
             if concurrent_by_series.get(series_key, 0) >= self._max_concurrent:
+                skipped_concurrent += 1
+                continue
+
+            # Event-Ticker Dedup: andere Systeme sperren komplett; Crypto max. N pro Event
+            et_mkt = market.get("event_ticker", "")
+            if et_mkt and et_mkt in cross_blocked_events:
+                skipped_event += 1
+                continue
+            if et_mkt and crypto_event_count.get(et_mkt, 0) >= self._max_concurrent_event:
+                skipped_event += 1
                 continue
 
             # Cross-Track Hedge-Check: kein Leiter-Einstieg wenn 15-Min-Position auf gleichem Asset
             if sym in active_15m_symbols:
+                skipped_hedge += 1
                 continue
 
             ctx = sym_ctxs.get(sym, {"bankroll_usd": bankroll_usd})
-            for cs in self._ladder_rules.evaluate(market, ctx):
+            mkt_signals = self._ladder_rules.evaluate(market, ctx)
+            for cs in mkt_signals:
                 await self._on_signal(_to_executor_signal(cs))
                 signals += 1
+                signals_by_series[series_key] += 1
+            if mkt_signals and et_mkt:
+                crypto_event_count[et_mkt] += 1
+
+        skip_info = []
+        if skipped_concurrent: skip_info.append(f"concurrent:{skipped_concurrent}")
+        if skipped_event:      skip_info.append(f"event-dedup:{skipped_event}")
+        if skipped_hedge:      skip_info.append(f"hedge:{skipped_hedge}")
+        if signals:
+            logger.info(
+                f"[Crypto/Leiter] {signals} Signal(e): "
+                + " ".join(f"{s}:{n}" for s, n in sorted(signals_by_series.items()))
+                + (f" | übersprungen: {', '.join(skip_info)}" if skip_info else "")
+            )
+        elif skip_info:
+            logger.debug(f"[Crypto/Leiter] 0 Signale | übersprungen: {', '.join(skip_info)}")
 
         # 15-Min Märkte
         if min15_markets and self._min15_on:
@@ -423,6 +523,116 @@ class CryptoScanner:
                         track       = track,
                     ))
                     signals += 1
+        return signals
+
+    # ── Track C: Zone/Spread-Bets ─────────────────────────────────────── #
+
+    async def _scan_zone(self, loop,
+                         cross_blocked_events: set[str],
+                         crypto_event_count: dict[str, int]) -> int:
+        """
+        Zone/Spread-Bet innerhalb desselben Events (Track C).
+
+        Kauft YES auf niedrigere + NO auf höhere Schwelle.
+        Edge: vol_ratio < 0.8 → aktuelle Volatilität < markt-implizierte Volatilität
+        → reale Zone-Wahrscheinlichkeit > Markt-Implied → positiver EV.
+
+        Payoff: in-Zone +($2-cost), außer-Zone +($1-cost).
+        Mit combined ≤ 95¢ sind alle Szenarien profitabel (kein Breakeven nötig).
+        Edge tritt auf wenn reale P_zone > Markt-Implied (weil momentan weniger Volatilität).
+        """
+        if not self._ladder_event_tickers:
+            return 0
+
+        bankroll_usd = self._bankroll
+        sym_ctxs: dict[str, dict] = {}
+        for sym, feed in self._bingx_feeds.items():
+            if feed.is_ready():
+                sym_ctxs[sym] = {**feed.context(), "bankroll_usd": bankroll_usd}
+
+        def _price(m, key):
+            v = m.get(key + "_dollars") or m.get(key)
+            if v is None:
+                return None
+            f = float(v)
+            return int(round(f * 100)) if f <= 1.0 else int(round(f))
+
+        def _threshold(ticker: str) -> float:
+            for sep in ("-T", "-B"):
+                if sep in ticker:
+                    try:
+                        return float(ticker.split(sep)[-1])
+                    except Exception:
+                        pass
+            return 0.0
+
+        signals = 0
+        for evt_ticker in self._ladder_event_tickers:
+            # Events mit Fremdpositionen oder bereits voll besetzten Crypto-Positionen überspringen
+            if evt_ticker in cross_blocked_events:
+                continue
+            if crypto_event_count.get(evt_ticker, 0) >= self._max_concurrent_event:
+                continue
+
+            try:
+                mkt_data = await loop.run_in_executor(
+                    None,
+                    lambda t=evt_ticker: self._client.get_markets(
+                        event_ticker=t, status="open", limit=60
+                    ),
+                )
+            except Exception:
+                continue
+
+            # vol_ratio vorab prüfen – spart Iteration wenn kein Edge
+            series = evt_ticker.split("-")[0]
+            sym    = series_to_symbol(series)
+            ctx    = sym_ctxs.get(sym, {"bankroll_usd": bankroll_usd}) if sym else {"bankroll_usd": bankroll_usd}
+            vol_ratio_raw = ctx.get("bingx_vol_ratio")
+            vol_ratio     = float(vol_ratio_raw) if vol_ratio_raw is not None else 1.0
+            if vol_ratio >= 0.8:  # Schnell-Exit: Zone-Regeln verlangen < 0.8
+                continue
+
+            # Märkte filtern und nach Schwelle sortieren
+            valid = []
+            for m in mkt_data.get("markets", []):
+                ya  = _price(m, "yes_ask")
+                na  = _price(m, "no_ask")
+                vol = float(m.get("volume_24h_fp", 0) or 0)
+                thr = _threshold(m.get("ticker", ""))
+                if ya is not None and na is not None and vol >= 500 and thr > 0:
+                    m["event_ticker"] = evt_ticker
+                    valid.append((m, thr, ya, na))
+
+            if len(valid) < 2:
+                continue
+
+            valid.sort(key=lambda x: x[1])  # aufsteigend nach Schwelle
+
+            # Nur direkt benachbarte Paare prüfen (1 Strike Abstand)
+            for i in range(len(valid) - 1):
+                m_low,  thr_low,  ya_low,  _       = valid[i]
+                m_high, thr_high, ya_high, na_high = valid[i + 1]
+
+                if thr_high <= thr_low:
+                    continue
+
+                pair_signals = self._zone_rules.evaluate_pair(m_low, m_high, ctx)
+                for cs in pair_signals:
+                    await self._on_signal(_to_executor_signal(cs))
+                    signals += 1
+
+                if pair_signals:
+                    combined = ya_low + na_high
+                    logger.info(
+                        f"[Crypto/Zone] {evt_ticker}: "
+                        f"T{thr_low:.0f}(YES@{ya_low}¢) + T{thr_high:.0f}(NO@{na_high}¢) "
+                        f"= {combined}¢ | vol_ratio={vol_ratio:.2f}"
+                    )
+                    break  # Maximal ein Paar pro Event pro Zyklus
+
+        if signals:
+            logger.info(f"[Crypto/Zone] {signals} Signal(e)")
         return signals
 
     # ── Exit-Logik (ALLE FIXES) ───────────────────────────────────────── #

@@ -106,7 +106,7 @@ async def main():
     # ── Shared Infrastruktur ──────────────────────────────────────────
     risk       = RiskManager(client, config)
     executor   = TradeExecutor(client, risk, trade_logger, config)
-    settlement = SettlementTracker(client, trade_logger, config)
+    settlement = SettlementTracker(client, trade_logger, config, risk=risk)
 
     systems_cfg = config.get("systems", {})
 

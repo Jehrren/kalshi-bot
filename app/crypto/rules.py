@@ -181,9 +181,17 @@ class CryptoLadderRuleEngine:
         if t == "yes_ask_above":
             thr         = int(cond.get("threshold", 85))
             min_hours   = float(cond.get("min_hours_remaining", 2.0))
+            max_hours   = float(cond.get("max_hours_remaining", 0))  # 0 = kein Limit
             min_over    = float(cond.get("spot_min_overshoot_pct", 1.0)) / 100
 
             if yes_ask is not None and yes_ask > thr:
+                # Max-Zeit-Check: keine Langfrist-Wetten (Monats/Jahres-Märkte)
+                if max_hours > 0 and hours_left > max_hours:
+                    logger.debug(
+                        f"[Crypto/Ladder] {ticker} – YES {yes_ask}¢ > {thr}¢ blockiert: "
+                        f"{hours_left:.0f}h verbleibend > max {max_hours:.0f}h"
+                    )
+                    return None
                 # Zeit-Check: mindestens X Stunden verbleibend
                 if hours_left < min_hours:
                     logger.debug(
@@ -192,6 +200,21 @@ class CryptoLadderRuleEngine:
                     )
                     return None
                 # Spot-Distanz-Check: Spot muss > Threshold + X% sein
+                if min_over > 0 and threshold_val <= 0:
+                    # Schwelle nicht aus Ticker parsebar (z.B. KXHYPEMAXMON) →
+                    # overshoot-Bedingung kann nicht geprüft werden → blockieren
+                    logger.debug(
+                        f"[Crypto/Ladder] {ticker} – NO-Kauf blockiert: "
+                        f"Schwelle nicht aus Ticker parsebar (spot_min_overshoot_pct erfordert Threshold)"
+                    )
+                    return None
+                if min_over > 0 and (not spot or spot <= 0):
+                    # Feed nicht bereit – keine Spot-Daten verfügbar
+                    logger.debug(
+                        f"[Crypto/Ladder] {ticker} – NO-Kauf blockiert: "
+                        f"kein Spot-Preis verfügbar (BingX-Feed noch nicht bereit)"
+                    )
+                    return None
                 if spot and spot > 0 and threshold_val > 0:
                     overshoot = (spot - threshold_val) / threshold_val
                     if overshoot < min_over:
@@ -213,10 +236,18 @@ class CryptoLadderRuleEngine:
             low          = int(cond.get("threshold_low", 73))
             high         = int(cond.get("threshold_high", 82))
             min_hours    = float(cond.get("min_hours_remaining", 4.0))
+            max_hours    = float(cond.get("max_hours_remaining", 0))  # 0 = kein Limit
             req_rsi_os   = bool(cond.get("require_rsi_oversold", False))
             rsi_os_thr   = float(cond.get("rsi_oversold_threshold", 40))
 
             if yes_ask is not None and low <= yes_ask <= high:
+                # Max-Zeit-Check: keine Langfrist-Wetten
+                if max_hours > 0 and hours_left > max_hours:
+                    logger.debug(
+                        f"[Crypto/Ladder] {ticker} – YES {yes_ask}¢ blockiert: "
+                        f"{hours_left:.0f}h verbleibend > max {max_hours:.0f}h"
+                    )
+                    return None
                 # Zeit-Check
                 if hours_left < min_hours:
                     logger.debug(
@@ -336,6 +367,202 @@ class CryptoLadderRuleEngine:
         return 0.0
 
 
+class CryptoZoneRuleEngine:
+    """
+    Zone/Spread-Bet Engine für Crypto-Tages-Leiter.
+
+    Kauft YES auf untere Schwelle + NO auf obere Schwelle desselben Events.
+
+    Payoff-Struktur (combined_cost = yes_ask_low + no_ask_high + 2×offset):
+      BTC im Zone [X_low, X_high]: +$2 - combined_cost/100  (BEIDE Legs gewinnen)
+      BTC außerhalb Zone:          +$1 - combined_cost/100  (EIN Leg gewinnt)
+      → combined ≤ 95¢ garantiert positive Payoffs in ALLEN Szenarien.
+
+    Echter Edge: vol_ratio < 0.8 = aktuelles BingX-Volumen < 20-Perioden-Durchschnitt.
+    → Momentane Volatilität niedriger als Markt-implied → Zone-Wahrscheinlichkeit
+    vom Markt unterschätzt → positiver EV.
+
+    HINWEIS: Beide Legs werden als unabhängige Signale gesendet. Füllt nur ein Leg,
+    entsteht eine normale Richtungsposition (unkritisch, aber kein Zone-Profil).
+    """
+
+    def __init__(self, config: dict):
+        self._rules = [
+            r for r in config.get("crypto_zone_rules", [])
+            if r.get("enabled", True)
+        ]
+        logger.info(f"[Crypto/ZoneRules] {len(self._rules)} aktive Regeln geladen")
+
+    def evaluate_pair(
+        self,
+        market_low: dict,   # untere Schwelle – wird als YES-Leg gekauft
+        market_high: dict,  # obere Schwelle – wird als NO-Leg gekauft
+        context: dict | None = None,
+    ) -> list[CryptoSignal]:
+        """Bewertet ein Markt-Paar auf Zone-Bet Eignung. Gibt 0 oder 2 Signale zurück."""
+        ctx = context or {}
+        for rule in self._rules:
+            result = self._eval_zone_rule(rule, market_low, market_high, ctx)
+            if result:
+                return result
+        return []
+
+    def _eval_zone_rule(
+        self,
+        rule: dict,
+        market_low: dict,
+        market_high: dict,
+        ctx: dict,
+    ) -> list[CryptoSignal] | None:
+        name = rule.get("name", "Zone-Bet")
+        cond = rule.get("condition", {})
+        act  = rule.get("action", {})
+
+        yes_ask_low  = self._price(market_low,  "yes_ask")
+        no_ask_low   = self._price(market_low,  "no_ask")
+        yes_ask_high = self._price(market_high, "yes_ask")
+        no_ask_high  = self._price(market_high, "no_ask")
+
+        if yes_ask_low is None or no_ask_high is None or yes_ask_high is None:
+            return None
+
+        # YES-Leg: untere Schwelle muss im konfigurierten Preisfenster liegen
+        yes_min = int(cond.get("yes_leg_min", 55))
+        yes_max = int(cond.get("yes_leg_max", 88))
+        if not (yes_min <= yes_ask_low <= yes_max):
+            return None
+
+        # NO-Leg: obere Schwelle soll hohe YES-Wahrscheinlichkeit haben (weit über Spot)
+        no_yes_min = int(cond.get("no_yes_ask_min", 85))
+        no_yes_max = int(cond.get("no_yes_ask_max", 98))
+        if not (no_yes_min <= yes_ask_high <= no_yes_max):
+            return None
+
+        # Combined-Cost-Check: inkl. Slippage (offset pro Leg)
+        max_combined = int(cond.get("max_combined_cost_cents", 95))
+        offset       = int(act.get("limit_offset_cents", 1))
+        combined     = yes_ask_low + no_ask_high + 2 * offset
+        if combined >= max_combined:
+            return None
+
+        # Profil-Check: combined > 100¢ → Out-of-Zone-Szenario ist Verlust → blockieren
+        if combined > 100:
+            logger.debug(
+                f"[Crypto/Zone] combined={combined}¢ > 100¢ → Out-of-Zone wäre Verlust"
+            )
+            return None
+
+        # Zeit-Check: genug Restlaufzeit
+        min_hours  = float(cond.get("min_hours_remaining", 3.0))
+        hours_low  = self._hours_remaining(market_low.get("close_time", ""))
+        hours_high = self._hours_remaining(market_high.get("close_time", ""))
+        if min(hours_low, hours_high) < min_hours:
+            return None
+
+        # vol_ratio-Check: niedriges Volumen = echter Edge
+        vol_ratio_raw = ctx.get("bingx_vol_ratio")
+        vol_ratio     = float(vol_ratio_raw) if vol_ratio_raw is not None else 1.0
+        max_vol_ratio = float(cond.get("max_vol_ratio", 0.8))
+        if vol_ratio >= max_vol_ratio:
+            logger.debug(
+                f"[Crypto/Zone] {market_low.get('ticker','?')} vol_ratio={vol_ratio:.2f} "
+                f"≥ {max_vol_ratio} – kein Edge"
+            )
+            return None
+
+        # RSI-Neutral-Check: kein starker Richtungstrend
+        rsi     = ctx.get("bingx_rsi")
+        rsi_min = float(cond.get("rsi_neutral_min", 35))
+        rsi_max = float(cond.get("rsi_neutral_max", 65))
+        if rsi is not None and not (rsi_min <= rsi <= rsi_max):
+            logger.debug(
+                f"[Crypto/Zone] {market_low.get('ticker','?')} RSI={rsi:.1f} "
+                f"außerhalb neutral [{rsi_min}–{rsi_max}] – blockiert"
+            )
+            return None
+
+        count        = int(act.get("count", 3))
+        px_yes       = max(1, min(99, yes_ask_low  + offset))
+        px_no        = max(1, min(99, no_ask_high  + offset))
+        event_ticker = market_low.get("event_ticker", "")
+        close_time   = market_low.get("close_time", "")
+
+        rsi_str = f" | RSI={rsi:.0f}" if rsi is not None else ""
+        reason = (
+            f"Zone YES@{yes_ask_low}¢+NO@{no_ask_high}¢={combined}¢ | "
+            f"in-zone +{profit_inzone}¢ / out-zone -{loss_outzone}¢ | "
+            f"vol_ratio={vol_ratio:.2f}{rsi_str}"
+        )
+
+        return [
+            CryptoSignal(
+                ticker      = market_low["ticker"],
+                rule_name   = f"{name} – YES",
+                side        = "yes",
+                action      = "buy",
+                price_cents = px_yes,
+                count       = count,
+                reason      = reason,
+                meta        = {
+                    "yes_ask":      yes_ask_low,
+                    "no_ask":       no_ask_low,
+                    "title":        market_low.get("title", "")[:80],
+                    "event_title":  (market_low.get("event_title") or "")[:120],
+                    "event_ticker": event_ticker,
+                    "close_time":   close_time,
+                    "category":     "crypto",
+                    "sub_title":    "",
+                    "image_url":    (market_low.get("image_url") or "").strip(),
+                    "system":       SYSTEM,
+                    "zone_partner": market_high.get("ticker", ""),
+                },
+                track = "zone",
+            ),
+            CryptoSignal(
+                ticker      = market_high["ticker"],
+                rule_name   = f"{name} – NO",
+                side        = "no",
+                action      = "buy",
+                price_cents = px_no,
+                count       = count,
+                reason      = reason,
+                meta        = {
+                    "yes_ask":      yes_ask_high,
+                    "no_ask":       no_ask_high,
+                    "title":        market_high.get("title", "")[:80],
+                    "event_title":  (market_high.get("event_title") or "")[:120],
+                    "event_ticker": event_ticker,
+                    "close_time":   close_time,
+                    "category":     "crypto",
+                    "sub_title":    "",
+                    "image_url":    (market_high.get("image_url") or "").strip(),
+                    "system":       SYSTEM,
+                    "zone_partner": market_low.get("ticker", ""),
+                },
+                track = "zone",
+            ),
+        ]
+
+    def _price(self, market: dict, key: str) -> Optional[int]:
+        v = market.get(key + "_dollars") or market.get(key)
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return int(round(f * 100)) if f <= 1.0 else int(round(f))
+        except (ValueError, TypeError):
+            return None
+
+    def _hours_remaining(self, close_str: str) -> float:
+        if not close_str:
+            return float("inf")
+        try:
+            ct = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+            return max(0.0, (ct - datetime.now(timezone.utc)).total_seconds() / 3600)
+        except Exception:
+            return float("inf")
+
+
 class Crypto15MinRuleEngine:
     """Eigenständige Rule Engine für BTC/ETH 15-Min Mean-Reversion-Märkte."""
 
@@ -381,7 +608,8 @@ class Crypto15MinRuleEngine:
 
         change     = ctx.get("btc_change_15min")
         rsi        = ctx.get("bingx_rsi")
-        vol_ratio  = ctx.get("bingx_vol_ratio", 1.0)
+        vol_ratio_raw = ctx.get("bingx_vol_ratio")
+        vol_ratio  = float(vol_ratio_raw) if vol_ratio_raw is not None else 1.0
         if change is None:
             return None
 
@@ -406,7 +634,7 @@ class Crypto15MinRuleEngine:
                 side    = "yes"
             else:
                 logger.debug(
-                    f"[15-Min] {ticker} kein Signal: RSI={rsi:.0f} "
+                    f"[15-Min] {ticker} kein Signal: RSI={rsi:.1f} "
                     f"(OB≥{rsi_ob}, OS≤{rsi_os}), Vol={vol_ratio:.2f} (min {vol_ratio_min})"
                 )
         else:

@@ -35,6 +35,7 @@ class RiskManager:
         self._positions: dict[str, float] = {}   # ticker → exposure USD
         self._expiry:    dict[str, str]   = {}   # ticker → ISO close_time (dry-run only)
         self._details:   dict[str, dict]  = {}   # ticker → volle Positions-Details
+        self._settled:   set[str]         = set() # bereits abgerechnete Ticker (kein Re-Entry)
         if self._dry_run:
             self._load_positions_from_file()
 
@@ -148,11 +149,47 @@ class RiskManager:
         except Exception as e:
             logger.debug(f"[Risk] positions.json konnte nicht geschrieben werden: {e}")
 
+    def set_settled_tickers(self, tickers: set[str]):
+        """Initialisiert die settled-Liste (beim Bot-Start vom SettlementTracker aufgerufen)."""
+        self._settled = set(tickers)
+        # Zombies sofort bereinigen: settled Positionen aus dem offenen Portfolio entfernen
+        zombies = [t for t in self._positions if t in self._settled]
+        for t in zombies:
+            self._positions.pop(t, None)
+            self._expiry.pop(t, None)
+            self._details.pop(t, None)
+        if zombies:
+            logger.info(f"[Risk] {len(zombies)} Zombie-Position(en) entfernt: {zombies}")
+            self._save_positions()
+
+    def mark_settled(self, ticker: str):
+        """Markiert einen Ticker als abgerechnet – entfernt Position und verhindert Re-Entry."""
+        self._settled.add(ticker)
+        had_data = (ticker in self._positions
+                    or ticker in self._expiry
+                    or ticker in self._details)
+        self._positions.pop(ticker, None)
+        self._expiry.pop(ticker, None)
+        self._details.pop(ticker, None)
+        if had_data:
+            self._save_positions()
+
     def get_total_exposure(self) -> float:
         return sum(self._positions.values())
 
     def get_open_count(self) -> int:
         return len(self._positions)
+
+    def get_open_tickers(self) -> set[str]:
+        return set(self._positions.keys())
+
+    def get_max_profit_open_usd(self) -> float:
+        """Max-Gewinn wenn alle offenen Positionen gewinnen."""
+        total = 0.0
+        for ticker, exposure in self._positions.items():
+            count = int(self._details.get(ticker, {}).get("count", 0))
+            total += count * 1.0 - exposure
+        return round(total, 2)
 
     def _system_exposure(self, system: str) -> float:
         """Berechnet die aktuelle Exposure eines Systems."""
@@ -162,9 +199,13 @@ class RiskManager:
         )
 
     def check_order_allowed(self, ticker: str, count: int, price_cents: int,
-                            system: str = "") -> tuple[bool, str]:
+                            system: str = "", event_ticker: str = "") -> tuple[bool, str]:
         exposure_usd = count * price_cents / 100
         current      = self._positions.get(ticker, 0.0)
+
+        # Bereits abgerechnete Ticker nicht erneut eröffnen (Zombie-Schutz)
+        if ticker in self._settled:
+            return False, f"Bereits abgerechnet – kein Re-Entry"
 
         # Im Dry-Run: bereits positionierte Märkte nicht nochmals bespielen.
         # Entspricht dem Verhalten einer noch ruhenden Limit-Order im echten Betrieb.
@@ -175,7 +216,20 @@ class RiskManager:
             return False, (f"Max-Position überschritten: {current:.2f} + "
                            f"{exposure_usd:.2f} > {self.max_position_usd:.2f} USD")
 
-        # System-Budget prüfen (wenn konfiguriert)
+        # Event-Ticker Dedup: max. N Positionen pro Event (systemspezifisch konfigurierbar).
+        # crypto: max_positions_per_event=2 erlaubt Zone-Bets (YES-Leg + NO-Leg).
+        # prediction/default: max_positions_per_event=1 (unverändertes Verhalten).
+        if event_ticker and ticker not in self._positions:
+            sys_cfg = self._config.get("systems", {}).get(system, {}) if system else {}
+            max_per_event = int(sys_cfg.get("max_positions_per_event", 1))
+            event_count = sum(
+                1 for d in self._details.values()
+                if d.get("event_ticker") == event_ticker
+            )
+            if event_count >= max_per_event:
+                return False, f"Event-Ticker Duplikat: {event_ticker}"
+
+        # System-Budget + Positions-Limit prüfen (wenn konfiguriert)
         if system:
             sys_cfg     = self._config.get("systems", {}).get(system, {})
             sys_max_usd = float(sys_cfg.get("max_exposure_usd", self.max_total_exposure_usd))
@@ -183,6 +237,14 @@ class RiskManager:
             if sys_current + exposure_usd > sys_max_usd:
                 return False, (f"System-Budget '{system}' überschritten: "
                                f"${sys_current:.2f} + ${exposure_usd:.2f} > ${sys_max_usd:.2f}")
+
+            sys_max_pos = int(sys_cfg.get("max_open_positions", 0))
+            if sys_max_pos > 0 and ticker not in self._positions:
+                sys_pos_count = sum(1 for d in self._details.values()
+                                    if d.get("system") == system)
+                if sys_pos_count >= sys_max_pos:
+                    return False, (f"System-Limit '{system}': "
+                                   f"{sys_pos_count} >= {sys_max_pos} Positionen")
 
         total = self.get_total_exposure()
         if total + exposure_usd > self.max_total_exposure_usd:
