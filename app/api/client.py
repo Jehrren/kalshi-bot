@@ -46,16 +46,26 @@ class KalshiClient:
 
     @staticmethod
     def _with_retry(fn: Callable[[], requests.Response]) -> requests.Response:
-        """Führt fn bis zu 3 Mal aus; wiederholt bei HTTP 429/503 mit exponentiellem Backoff (1s, 2s, 4s)."""
+        """Führt fn bis zu 3 Mal aus; wiederholt bei HTTP 429/503 und Netzwerkfehlern mit exponentiellem Backoff."""
         max_attempts = 3
         for attempt in range(max_attempts):
-            r = fn()
+            try:
+                r = fn()
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                if attempt == max_attempts - 1:
+                    raise
+                wait = 2 ** attempt
+                logger.warning(
+                    f"[Client] Netzwerkfehler – Retry {attempt + 1}/{max_attempts - 1} in {wait}s: {exc}"
+                )
+                time.sleep(wait)
+                continue
             if r.status_code not in (429, 503) or attempt == max_attempts - 1:
                 return r
-            wait = 2 ** attempt  # 1, 2, 4 Sekunden
+            wait = 2 ** attempt
             logger.warning(f"[Client] HTTP {r.status_code} – Retry {attempt + 1}/{max_attempts - 1} in {wait}s")
             time.sleep(wait)
-        return r  # wird von raise_for_status() im Caller behandelt
+        return r
 
     def _sign(self, method: str, path: str) -> dict:
         """Erzeugt die Auth-Header für einen REST-Request (PATH_PREFIX wird vorangestellt)."""
