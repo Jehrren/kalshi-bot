@@ -12,7 +12,7 @@
             "enabled": true,
             "max_exposure_usd": 80.0,
             "max_position_usd": 20.0,
-            "max_open_positions": 15,
+            "max_open_positions": 10,
             "max_positions_per_event": 2
         },
         "crypto": {
@@ -21,6 +21,13 @@
             "max_position_usd": 20.0,
             "max_open_positions": 10,
             "max_positions_per_event": 2
+        },
+        "weather": {
+            "enabled": true,
+            "max_exposure_usd": 40.0,
+            "max_position_usd": 10.0,
+            "max_open_positions": 8,
+            "max_positions_per_event": 1
         }
     },
 
@@ -39,7 +46,7 @@
         "categories": [
             "economics", "financials", "politics", "elections", "companies",
             "world", "health", "science and technology", "entertainment",
-            "social", "climate and weather", "transportation"
+            "social", "transportation"
         ]
     },
 
@@ -261,6 +268,90 @@
                 "min_hours_remaining": 3.0
             },
             "action": {
+                "order_type": "limit",
+                "count": 3,
+                "limit_offset_cents": 1
+            }
+        }
+    ],
+
+    "weather_scanner": {
+        "interval_seconds": 300,
+        "max_close_hours": 48,
+        "min_volume_usd": 25,
+        "max_concurrent_per_city": 2,
+        "feed_refresh_seconds": 300
+    },
+
+    "weather_rules": [
+        {
+            "name": "Filter – Range/Bracket-Kontrakte ausschließen",
+            "enabled": true,
+            "condition": { "type": "title_not_contains", "value": "range" },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Filter – 50/50-Zone (43–57¢)",
+            "enabled": true,
+            "condition": { "type": "yes_ask_between", "threshold_low": 43, "threshold_high": 57 },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Ensemble-Edge – Probability-Gap ≥ 15¢",
+            "description": "Kern-Regel: GFS-Ensemble-Probability vs. Marktpreis. Edge mindestens 15¢, hohe Konfidenz nötig.",
+            "enabled": true,
+            "condition": {
+                "type": "ensemble_edge",
+                "min_edge_cents": 15,
+                "min_hours_remaining": 2.0,
+                "max_hours_remaining": 48,
+                "min_confidence": 0.3,
+                "max_spread_f": 5.0
+            },
+            "action": {
+                "side": "auto",
+                "order_type": "limit",
+                "limit_offset_cents": 1,
+                "kelly_sizing": true,
+                "kelly_fraction": 0.25,
+                "min_count": 1,
+                "max_count": 8
+            }
+        },
+        {
+            "name": "YES >88% → NO kaufen (knapper Forecast-Margin < 3°F)",
+            "description": "Markt überschätzt Sicherheit bei kleinem Abstand Forecast/Schwelle.",
+            "enabled": true,
+            "condition": {
+                "type": "yes_ask_above",
+                "threshold": 88,
+                "forecast_min_margin_f": 3.0,
+                "min_hours_remaining": 2.0,
+                "max_hours_remaining": 48
+            },
+            "action": {
+                "side": "no",
+                "order_type": "limit",
+                "limit_offset_cents": 1,
+                "kelly_sizing": true,
+                "kelly_fraction": 0.25,
+                "min_count": 1,
+                "max_count": 8
+            }
+        },
+        {
+            "name": "Gut kalibrierte Zone (73–82%) → YES kaufen",
+            "description": "Nur bei hoher Forecast-Konfidenz (niedriger Ensemble-Spread).",
+            "enabled": true,
+            "condition": {
+                "type": "yes_ask_between",
+                "threshold_low": 73,
+                "threshold_high": 82,
+                "min_hours_remaining": 4.0,
+                "max_spread_f": 4.0
+            },
+            "action": {
+                "side": "yes",
                 "order_type": "limit",
                 "count": 3,
                 "limit_offset_cents": 1

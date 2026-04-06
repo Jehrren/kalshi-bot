@@ -31,6 +31,7 @@ _TRACK_SCORES: dict[str, float] = {
     "arb":          0.75,  # Leiter-Arbitrage (echte Preisumkehr)
     "pred_zone":    0.72,  # Prediction-Ladder Zone-Bet (garantierter Edge ohne vol_ratio)
     "zone":         0.70,  # Zone/Spread-Bet (Niedrig-Vol Edge)
+    "weather":      0.65,  # Wetter-Märkte (Ensemble-Edge)
     "politisch":    0.50,  # Politische/wirtschaftliche Märkte
 }
 
@@ -222,7 +223,8 @@ class TradeExecutor:
             )
             if not allowed:
                 logger.debug(f"[Executor] Abgelehnt | {signal.ticker}: {reason}")
-                _expected = ("Bereits positioniert", "Max-Position", "Max-Exposure",
+                _expected = ("Bereits positioniert", "Bereits abgerechnet",
+                             "Max-Position", "Max-Exposure",
                              "System-Budget", "System-Limit", "Event-Ticker Duplikat",
                              "Max. offene Positionen")
                 if not any(reason.startswith(p) for p in _expected):

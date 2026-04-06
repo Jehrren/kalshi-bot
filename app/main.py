@@ -1,7 +1,8 @@
 """
-Kalshi Trading Bot – Dual-System-Architektur
+Kalshi Trading Bot – Triple-System-Architektur
   System 1: Prediction Markets (politisch, wirtschaftlich)
   System 2: Crypto Markets (BTC/ETH Leiter + 15-Min)
+  System 3: Weather Markets (Temperatur-Leiter mit GFS-Ensemble)
 """
 
 import asyncio
@@ -28,6 +29,7 @@ from api.client import KalshiClient
 from crypto.scanner import CryptoScanner
 from logger.trade_logger import TradeLogger
 from prediction.scanner import PredictionScanner
+from weather.scanner import WeatherScanner
 from risk.manager import RiskManager
 from settlement.tracker import SettlementTracker
 from trader.executor import TradeExecutor
@@ -49,7 +51,7 @@ def load_config() -> dict:
 def validate_config(config: dict) -> list[str]:
     errors = []
     systems = config.get("systems", {})
-    for sys_name in ("prediction", "crypto"):
+    for sys_name in ("prediction", "crypto", "weather"):
         s = systems.get(sys_name, {})
         if float(s.get("max_exposure_usd", 80)) <= 0:
             errors.append(f"systems.{sys_name}.max_exposure_usd muss > 0 sein")
@@ -74,9 +76,10 @@ async def main():
         sys.exit(1)
 
     logger.info("=" * 60)
-    logger.info("  Kalshi Trading Bot – Dual-System")
+    logger.info("  Kalshi Trading Bot – Triple-System")
     logger.info("  System 1: Prediction Markets")
     logger.info("  System 2: Crypto Markets")
+    logger.info("  System 3: Weather Markets")
     logger.info("=" * 60)
 
     client = KalshiClient(api_key_id, private_key)
@@ -136,7 +139,20 @@ async def main():
         )
         logger.info("[Main] System 2 (Crypto Markets) aktiv")
 
-    trade_logger.log_system("BOOT", "Dual-System Bot startet")
+    # ── System 3: Weather Scanner ─────────────────────────────────────
+    weather_scanner = None
+    if systems_cfg.get("weather", {}).get("enabled", True):
+        weather_scanner = WeatherScanner(
+            client=client,
+            trade_logger=trade_logger,
+            config=config,
+            on_signal=executor.handle_signal,
+            on_meta=risk.update_detail,
+            on_cycle_end=executor.handle_cycle_end,
+        )
+        logger.info("[Main] System 3 (Weather Markets) aktiv")
+
+    trade_logger.log_system("BOOT", "Triple-System Bot startet")
 
     shutdown_event = asyncio.Event()
     loop           = asyncio.get_running_loop()
@@ -181,6 +197,8 @@ async def main():
         tasks.append(asyncio.create_task(prediction_scanner.start(), name="prediction"))
     if crypto_scanner:
         tasks.append(asyncio.create_task(crypto_scanner.start(), name="crypto"))
+    if weather_scanner:
+        tasks.append(asyncio.create_task(weather_scanner.start(), name="weather"))
 
     logger.info(f"[Main] Bot läuft mit {len(tasks) - 4} aktivem/n Scanner-System(en).")
     await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -190,6 +208,8 @@ async def main():
         await prediction_scanner.stop()
     if crypto_scanner:
         await crypto_scanner.stop()
+    if weather_scanner:
+        await weather_scanner.stop()
     await executor.stop()
 
     for t in tasks:
