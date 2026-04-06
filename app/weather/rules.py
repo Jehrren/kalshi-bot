@@ -265,15 +265,23 @@ class WeatherRuleEngine:
             fraction = float(act.get("kelly_fraction", 0.25))
             min_cnt  = int(act.get("min_count", 1))
             max_cnt  = int(act.get("max_count", 8))
-            if side == "no":
+            # Bei ensemble_edge kennen wir die echte Probability bereits
+            if t == "ensemble_edge" and feed is not None and threshold_val > 0:
+                market_type = market.get("_market_type", "high")
+                ens_p = feed.ensemble_probability(threshold_val, market_type)
+                if side == "yes":
+                    true_p = ens_p
+                else:
+                    true_p = 1.0 - ens_p
+            elif side == "no":
                 edge_p = no_ask or px
                 true_p = 1.0 - weather_corrected_prob(100 - edge_p)
             else:
                 edge_p = yes_ask or px
                 true_p = weather_corrected_prob(edge_p)
-            kelly_c = kelly_count(edge_p, true_p, bankroll, fraction, min_cnt, max_cnt)
+            kelly_c = kelly_count(px, true_p, bankroll, fraction, min_cnt, max_cnt)
             if kelly_c == 0:
-                logger.debug(f"[Weather/Kelly] {ticker} – kein Edge bei {edge_p}¢")
+                logger.debug(f"[Weather/Kelly] {ticker} – kein Edge bei {px}¢ (true_p={true_p:.2%})")
                 return None
             count  = kelly_c
             reason += f" · Kelly={count}ct"
