@@ -189,10 +189,14 @@ class PredictionScanner:
                 if ct_str:
                     try:
                         ct = datetime.fromisoformat(ct_str.replace("Z", "+00:00"))
-                        if (ct - now_utc).total_seconds() > max_secs:
+                        secs_remaining = (ct - now_utc).total_seconds()
+                        # Markt bereits abgelaufen → überspringen (Bug-Fix)
+                        if secs_remaining <= 0:
+                            continue
+                        if secs_remaining > max_secs:
                             continue
                     except Exception:
-                        pass
+                        continue
                 if self._min_volume > 0:
                     if float(m.get("volume_24h_fp", 0) or 0) < self._min_volume:
                         continue
@@ -461,30 +465,30 @@ class PredictionScanner:
             sell_price: int = max(1, entry_px - 1)
 
             if side == "no":
-                # Take-Profit: NO Bid ≥ 2.2× Einstieg
-                tp_target = int(entry_px * 2.2)
+                # Take-Profit: NO Bid ≥ 1.7× Einstieg
+                tp_target = int(entry_px * 1.7)
                 if no_bid and no_bid >= tp_target:
-                    exit_reason = f"Take-Profit: NO bid {no_bid}¢ ≥ 2.2× {entry_px}¢"
+                    exit_reason = f"Take-Profit: NO bid {no_bid}¢ ≥ 1.7× {entry_px}¢"
                     sell_price  = max(1, no_bid - 1)
-                # Zeit-Stop: < 30 Min + mehr als 60% Verlust
-                elif mins_left < 30 and no_bid and no_bid < int(entry_px * 0.4):
+                # Zeit-Stop: < 30 Min + bid < 50% (Analyse zeigt: Type-1-Trades bis 50%)
+                elif mins_left < 30 and no_bid and no_bid < int(entry_px * 0.5):
                     exit_reason = (
                         f"Zeit-Stop: {mins_left:.0f}min verbl. | "
-                        f"NO bid {no_bid}¢ < 40% von Einstieg {entry_px}¢"
+                        f"NO bid {no_bid}¢ < 50% von Einstieg {entry_px}¢"
                     )
                     sell_price = max(1, no_bid or 1)
 
             elif side == "yes":
-                # Take-Profit: YES Bid ≥ 2.2× Einstieg (cap 95¢)
-                tp_target = min(95, int(entry_px * 2.2))
+                # Take-Profit: YES Bid ≥ 1.7× Einstieg (cap 95¢)
+                tp_target = min(95, int(entry_px * 1.7))
                 if yes_bid and yes_bid >= tp_target:
                     exit_reason = f"Take-Profit: YES bid {yes_bid}¢ ≥ {tp_target}¢"
                     sell_price  = max(1, yes_bid - 1)
-                # Zeit-Stop: < 30 Min + mehr als 60% Verlust
-                elif mins_left < 30 and yes_bid and yes_bid < int(entry_px * 0.4):
+                # Zeit-Stop: < 30 Min + bid < 50%
+                elif mins_left < 30 and yes_bid and yes_bid < int(entry_px * 0.5):
                     exit_reason = (
                         f"Zeit-Stop: {mins_left:.0f}min verbl. | "
-                        f"YES bid {yes_bid}¢ < 40% von Einstieg {entry_px}¢"
+                        f"YES bid {yes_bid}¢ < 50% von Einstieg {entry_px}¢"
                     )
                     sell_price = max(1, yes_bid or 1)
 

@@ -564,7 +564,22 @@ class CryptoZoneRuleEngine:
 
 
 class Crypto15MinRuleEngine:
-    """Eigenständige Rule Engine für BTC/ETH 15-Min Mean-Reversion-Märkte."""
+    """
+    Rule Engine für BTC/ETH/SOL/XRP/DOGE/BNB 15-Min-Märkte.
+
+    Unterstützte Regel-Typen:
+      - btc_15min_spot_convergence: Spot-Distance Convergence (NEU, ersetzt Mean-Reversion)
+      - btc_15min_mean_reversion: Mean Reversion (DEPRECATED, -42$ Verlust bei 16% WR)
+
+    Spot-Distance Convergence Logik:
+      1. Parse Threshold aus Ticker (z.B. KXBTC15M-...-T71500 → 71500)
+      2. Hole BingX Spot-Preis
+      3. Berechne signierten Abstand: (spot - threshold) / threshold
+      4. Wenn |Abstand| > min_distance_pct UND Restlaufzeit im Fenster:
+         - Spot ÜBER Schwelle → kauf YES (markt-in-the-money)
+         - Spot UNTER Schwelle → kauf NO (markt-in-the-money)
+      5. Kelly-Sizing basierend auf Abstand (größerer Abstand = höhere Konfidenz)
+    """
 
     def __init__(self, config: dict):
         self._rules = [
@@ -576,6 +591,7 @@ class Crypto15MinRuleEngine:
     def evaluate(self, market: dict, context: dict | None = None) -> list[CryptoSignal]:
         ticker  = market.get("ticker", "")
         yes_ask = self._price(market, "yes_ask")
+        no_ask  = self._price(market, "no_ask")
         volume  = float(market.get("volume_24h_fp", 0) or 0)
         ctx     = context or {}
 
@@ -593,10 +609,146 @@ class Crypto15MinRuleEngine:
             act = rule.get("action", {})
             if act.get("side") == "SKIP":
                 continue
-            sig = self._eval_mean_reversion(rule, ticker, yes_ask, market, ctx)
+            cond_type = rule.get("condition", {}).get("type", "")
+            if cond_type == "btc_15min_spot_convergence":
+                sig = self._eval_spot_convergence(rule, ticker, yes_ask, no_ask, market, ctx)
+            elif cond_type == "btc_15min_mean_reversion":
+                sig = self._eval_mean_reversion(rule, ticker, yes_ask, market, ctx)
+            else:
+                sig = None
             if sig:
                 signals.append(sig)
         return signals
+
+    def _eval_spot_convergence(
+        self, rule: dict, ticker: str,
+        yes_ask: Optional[int], no_ask: Optional[int],
+        market: dict, ctx: dict,
+    ) -> Optional[CryptoSignal]:
+        """
+        Spot-Distance Convergence für 15-Min-Märkte.
+
+        Nutzt BingX Spot-Preis vs. Kalshi-Schwelle. Bei großem Abstand
+        zum Settlement-Zeitpunkt ist die in-the-money-Seite fast sicher.
+        """
+        cond = rule.get("condition", {})
+        act  = rule.get("action", {})
+        name = rule.get("name", "15M Spot-Convergence")
+
+        # Threshold aus Ticker parsen (-T Suffix)
+        threshold = self._ticker_threshold(ticker)
+        if threshold <= 0:
+            return None
+
+        # Spot-Preis aus BingX-Kontext
+        spot = ctx.get("btc_price")  # shared key für alle Crypto-Assets
+        if not spot or spot <= 0:
+            return None
+
+        # Restlaufzeit (in Minuten)
+        close_str = market.get("close_time", "")
+        mins_left = self._hours_remaining(close_str) * 60 if close_str else 999.0
+
+        min_mins = float(cond.get("min_mins_remaining", 2.0))
+        max_mins = float(cond.get("max_mins_remaining", 12.0))
+        if mins_left < min_mins or mins_left > max_mins:
+            return None
+
+        # Stunden-Blacklist (UTC): bekannte toxische Zeitfenster
+        blocked_hours = cond.get("blocked_hours_utc", [])
+        if blocked_hours:
+            now_hour = datetime.now(timezone.utc).hour
+            if now_hour in blocked_hours:
+                logger.debug(
+                    f"[15M/Spot] {ticker} blockiert: Stunde {now_hour}:00 UTC auf Blacklist"
+                )
+                return None
+
+        # Signierter Abstand: positiv = Spot über Schwelle (YES wahrscheinlich)
+        distance_pct = (spot - threshold) / threshold * 100
+        min_distance_pct = float(cond.get("min_distance_pct", 0.4))
+
+        if abs(distance_pct) < min_distance_pct:
+            logger.debug(
+                f"[15M/Spot] {ticker} Abstand {distance_pct:+.2f}% < {min_distance_pct}% – skip"
+            )
+            return None
+
+        # Seite + Preis bestimmen
+        max_yes = int(cond.get("max_yes_price", 88))
+        min_yes = int(cond.get("min_yes_price", 12))
+        offset  = int(act.get("limit_offset_cents", 1))
+
+        if distance_pct > 0:
+            # Spot ist ÜBER Schwelle → YES ist "in-the-money" → kauf YES
+            if yes_ask is None or yes_ask >= max_yes:
+                return None
+            side    = "yes"
+            edge_p  = yes_ask
+            px      = max(1, min(99, yes_ask + offset))
+        else:
+            # Spot ist UNTER Schwelle → NO ist "in-the-money" → kauf NO
+            if no_ask is None or no_ask >= max_yes:
+                return None
+            side    = "no"
+            edge_p  = no_ask
+            px      = max(1, min(99, no_ask + offset))
+
+        # Echte Wahrscheinlichkeit basierend auf Abstand + Zeit
+        # Größerer Abstand + weniger Zeit = höhere Konfidenz
+        abs_dist = abs(distance_pct)
+        if abs_dist >= 1.0:
+            true_p = 0.96
+        elif abs_dist >= 0.7:
+            true_p = 0.92
+        elif abs_dist >= 0.5:
+            true_p = 0.88
+        else:  # 0.4-0.5%
+            true_p = 0.84
+
+        # Zeit-Bonus: bei <5 Min Restlaufzeit ist das Ergebnis fast festgelegt
+        if mins_left <= 3:
+            true_p = min(0.99, true_p + 0.04)
+        elif mins_left <= 5:
+            true_p = min(0.99, true_p + 0.02)
+
+        # Kelly-Sizing
+        bankroll = float(ctx.get("bankroll_usd", 75.0))
+        fraction = float(act.get("kelly_fraction", 0.30))
+        min_cnt  = int(act.get("min_count", 1))
+        max_cnt  = int(act.get("max_count", 10))
+        kelly_c  = kelly_count(px, true_p, bankroll, fraction, min_cnt, max_cnt)
+        if kelly_c == 0:
+            logger.debug(f"[15M/Spot] {ticker} kein Edge bei {edge_p}¢ (true_p={true_p:.2%})")
+            return None
+
+        reason = (
+            f"Spot {spot:,.2f} vs Schwelle {threshold:,.2f} = {distance_pct:+.2f}% | "
+            f"{mins_left:.0f}min verbl. | {side.upper()} @ {edge_p}¢ "
+            f"(P≈{true_p:.0%}) · Kelly={kelly_c}ct"
+        )
+
+        return CryptoSignal(
+            ticker      = ticker,
+            rule_name   = name,
+            side        = side,
+            action      = "buy",
+            price_cents = px,
+            count       = kelly_c,
+            reason      = reason,
+            meta        = {
+                "yes_ask":    yes_ask,
+                "no_ask":     no_ask,
+                "close_time": market.get("close_time", ""),
+                "title":      market.get("title", "")[:80],
+                "spot_price": spot,
+                "threshold":  threshold,
+                "distance_pct": round(distance_pct, 3),
+                "mins_left":  round(mins_left, 1),
+                "system":     SYSTEM,
+            },
+            track       = "crypto_15min",
+        )
 
     def _eval_mean_reversion(self, rule: dict, ticker: str,
                               yes_ask: Optional[int], market: dict,
@@ -683,3 +835,22 @@ class Crypto15MinRuleEngine:
             return int(round(f * 100)) if f <= 1.0 else int(round(f))
         except (ValueError, TypeError):
             return None
+
+    def _ticker_threshold(self, ticker: str) -> float:
+        """Parst numerische Schwelle aus Ticker (z.B. KXBTC15M-...-T71500 → 71500.0)."""
+        for sep in ("-T", "-B"):
+            if sep in ticker:
+                try:
+                    return float(ticker.split(sep)[-1])
+                except Exception:
+                    pass
+        return 0.0
+
+    def _hours_remaining(self, close_str: str) -> float:
+        if not close_str:
+            return float("inf")
+        try:
+            ct = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+            return max(0.0, (ct - datetime.now(timezone.utc)).total_seconds() / 3600)
+        except Exception:
+            return float("inf")

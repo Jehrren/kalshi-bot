@@ -10,23 +10,23 @@
     "systems": {
         "prediction": {
             "enabled": true,
-            "max_exposure_usd": 80.0,
-            "max_position_usd": 20.0,
-            "max_open_positions": 10,
+            "max_exposure_usd": 55.0,
+            "max_position_usd": 15.0,
+            "max_open_positions": 8,
             "max_positions_per_event": 2
         },
         "crypto": {
             "enabled": true,
-            "max_exposure_usd": 80.0,
+            "max_exposure_usd": 75.0,
             "max_position_usd": 20.0,
             "max_open_positions": 10,
             "max_positions_per_event": 2
         },
         "weather": {
             "enabled": true,
-            "max_exposure_usd": 40.0,
-            "max_position_usd": 10.0,
-            "max_open_positions": 8,
+            "max_exposure_usd": 70.0,
+            "max_position_usd": 15.0,
+            "max_open_positions": 10,
             "max_positions_per_event": 1
         }
     },
@@ -88,9 +88,14 @@
         },
         {
             "name": "Stark überschätztes YES (>90%) → NO kaufen",
-            "description": "~3–5% Overconfidence-Bias. Kelly-Sizing mit -2% Korrektur.",
+            "description": "~3–5% Overconfidence-Bias. Kelly-Sizing mit -2% Korrektur. Nur bei >2h Restlaufzeit (Bug-Fix).",
             "enabled": true,
-            "condition": { "type": "yes_ask_above", "threshold": 90 },
+            "condition": {
+                "type": "yes_ask_above",
+                "threshold": 90,
+                "threshold_max": 95,
+                "min_hours_remaining": 2.0
+            },
             "action": {
                 "side": "no", "order_type": "limit", "limit_offset_cents": 1,
                 "kelly_sizing": true, "kelly_fraction": 0.25,
@@ -108,7 +113,7 @@
         },
         {
             "name": "Gut kalibrierte Zone (73–82%) → YES kaufen (mind. 4h Restlaufzeit)",
-            "description": "Beste Kalibrierung laut Polymarket-Daten. NUR wenn > 4h verbleibend.",
+            "description": "Beste Kalibrierung laut Polymarket-Daten. NUR wenn > 4h verbleibend. Kelly 0.40 (100% WR bewiesen).",
             "enabled": true,
             "condition": {
                 "type": "yes_ask_between",
@@ -117,7 +122,9 @@
                 "min_hours_remaining": 4.0
             },
             "action": {
-                "side": "yes", "order_type": "limit", "count": 5, "limit_offset_cents": 1
+                "side": "yes", "order_type": "limit", "limit_offset_cents": 1,
+                "kelly_sizing": true, "kelly_fraction": 0.40,
+                "min_count": 3, "max_count": 12
             }
         },
         {
@@ -209,7 +216,7 @@
         },
         {
             "name": "Leiter – YES 73–82% → YES kaufen (RSI überverkauft + mind. 4h)",
-            "description": "NUR wenn RSI-Signal überverkauft UND > 4h verbleibend.",
+            "description": "NUR wenn RSI-Signal überverkauft UND > 4h verbleibend. Kelly 0.40 (100% WR bewiesen).",
             "enabled": true,
             "condition": {
                 "type": "yes_ask_between",
@@ -221,7 +228,9 @@
                 "rsi_oversold_threshold": 40
             },
             "action": {
-                "side": "yes", "order_type": "limit", "count": 5, "limit_offset_cents": 1
+                "side": "yes", "order_type": "limit", "limit_offset_cents": 1,
+                "kelly_sizing": true, "kelly_fraction": 0.40,
+                "min_count": 3, "max_count": 12
             }
         }
     ],
@@ -229,15 +238,15 @@
     "crypto_15min_rules": [
         {
             "name": "15-Min – Mindest-Volumen $1000",
-            "description": "DEAKTIVIERT: volume_24h_fp ist für 15M-Märkte immer 0 (Markt existiert nur 15 Min). Filter würde alle Märkte blocken.",
+            "description": "DEAKTIVIERT: volume_24h_fp ist für 15M-Märkte immer 0 (Markt existiert nur 15 Min).",
             "enabled": false,
             "condition": { "type": "min_volume_usd", "threshold": 1000 },
             "action": { "side": "SKIP" }
         },
         {
-            "name": "15-Min – Mean Reversion",
-            "description": "Faded Retail-Überreaktion. RSI-bestätigt. Nur bei erhöhtem Volumen (>1.1× DMA).",
-            "enabled": true,
+            "name": "15-Min – Mean Reversion (DEAKTIVIERT)",
+            "description": "DEAKTIVIERT nach Analyse: 16% WR, -$42 Verlust. Crypto trendet kurzfristig, mean-reversion funktioniert nicht. Ersetzt durch Spot-Convergence.",
+            "enabled": false,
             "condition": {
                 "type": "btc_15min_mean_reversion",
                 "change_threshold_pct": 0.6,
@@ -247,6 +256,28 @@
                 "vol_ratio_min": 1.1
             },
             "action": { "order_type": "limit", "count": 5, "limit_offset_cents": 1 }
+        },
+        {
+            "name": "15-Min – Spot-Distance Convergence",
+            "description": "Neue Strategie: BingX Spot-Preis vs. Kalshi-Schwelle. Bei >0.4% Abstand und <12min Restlaufzeit ist die in-the-money-Seite sehr wahrscheinlich korrekt. Gleiches Prinzip wie die Daily Leiter 73-82% Regel (100% WR).",
+            "enabled": true,
+            "condition": {
+                "type": "btc_15min_spot_convergence",
+                "min_distance_pct": 0.4,
+                "min_mins_remaining": 2.0,
+                "max_mins_remaining": 12.0,
+                "max_yes_price": 88,
+                "min_yes_price": 12,
+                "blocked_hours_utc": [22, 23]
+            },
+            "action": {
+                "order_type": "limit",
+                "limit_offset_cents": 1,
+                "kelly_sizing": true,
+                "kelly_fraction": 0.30,
+                "min_count": 1,
+                "max_count": 10
+            }
         }
     ],
 
@@ -280,12 +311,20 @@
         "max_close_hours": 48,
         "min_volume_usd": 25,
         "max_concurrent_per_city": 2,
-        "feed_refresh_seconds": 300
+        "feed_refresh_seconds": 300,
+        "city_whitelist": ["Miami", "New York", "Boston", "Seattle", "San Antonio", "Atlanta"]
     },
 
     "weather_rules": [
         {
-            "name": "Filter – Range/Bracket-Kontrakte ausschließen",
+            "name": "Filter – Bracket-Kontrakte (-B) ausschließen",
+            "description": "Bracket-Märkte sind mit ensemble_probability() mathematisch nicht sauber bewertbar (P(≥X) ≠ P(in [X, X+1])). Daten bestätigen: 36% WR, -$19 Verlust.",
+            "enabled": true,
+            "condition": { "type": "ticker_not_contains", "value": "-B" },
+            "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Filter – Range/Bracket-Kontrakte (Titel) ausschließen",
             "enabled": true,
             "condition": { "type": "title_not_contains", "value": "range" },
             "action": { "side": "SKIP" }
@@ -341,7 +380,7 @@
         },
         {
             "name": "Gut kalibrierte Zone (73–82%) → YES kaufen",
-            "description": "Nur bei hoher Forecast-Konfidenz (niedriger Ensemble-Spread).",
+            "description": "Nur bei hoher Forecast-Konfidenz (niedriger Ensemble-Spread). Kelly 0.40.",
             "enabled": true,
             "condition": {
                 "type": "yes_ask_between",
@@ -353,8 +392,11 @@
             "action": {
                 "side": "yes",
                 "order_type": "limit",
-                "count": 3,
-                "limit_offset_cents": 1
+                "limit_offset_cents": 1,
+                "kelly_sizing": true,
+                "kelly_fraction": 0.40,
+                "min_count": 2,
+                "max_count": 10
             }
         }
     ],

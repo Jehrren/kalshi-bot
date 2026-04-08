@@ -714,10 +714,10 @@ class CryptoScanner:
             sell_price:  int           = entry_px
 
             if side == "no":
-                # Take-Profit: NO bid ≥ 2.5× Einstieg (mehr Geduld als 2×)
-                tp_target = int(entry_px * 2.5)
+                # Take-Profit: NO bid ≥ 1.7× Einstieg (Daten zeigen: früher Exit ist besser)
+                tp_target = int(entry_px * 1.7)
                 if no_bid and no_bid >= tp_target:
-                    exit_reason = f"Take-Profit: NO bid {no_bid}¢ ≥ 2.5× {entry_px}¢"
+                    exit_reason = f"Take-Profit: NO bid {no_bid}¢ ≥ 1.7× {entry_px}¢"
                     sell_price  = max(1, no_bid - 1)
 
                 # Stop-Loss: Spot nah an Schwelle – NUR wenn < 30min (FIX: war 2h)
@@ -744,13 +744,13 @@ class CryptoScanner:
                     sell_price = max(1, no_bid or 1)
 
             elif side == "yes":
-                # Take-Profit: YES bid ≥ 1.8× Einstieg (cap 95¢)
-                tp_target = min(95, int(entry_px * 1.8))
+                # Take-Profit: YES bid ≥ 1.7× Einstieg (cap 95¢)
+                tp_target = min(95, int(entry_px * 1.7))
                 if yes_bid and yes_bid >= tp_target:
                     exit_reason = f"Take-Profit: YES bid {yes_bid}¢ ≥ {tp_target}¢"
                     sell_price  = max(1, yes_bid - 1)
 
-                # Zeit-Stop: < 10min + bid < entry × 0.5 (FIX: war absolut ≤ 20¢)
+                # Zeit-Stop: < 10min + bid < entry × 0.5 (Analyse bestätigt: nur Tot-Trades)
                 elif mins_left < 10 and yes_bid and yes_bid < int(entry_px * 0.5):
                     exit_reason = (
                         f"Zeit-Stop: {mins_left:.0f}min verbl. | "

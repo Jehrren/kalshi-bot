@@ -168,10 +168,19 @@ class PredictionRuleEngine:
         matched, reason = False, ""
 
         if t == "yes_ask_above":
-            thr = int(cond.get("threshold", 90))
-            if yes_ask is not None and yes_ask > thr:
+            thr       = int(cond.get("threshold", 90))
+            thr_max   = int(cond.get("threshold_max", 100))
+            min_hours = float(cond.get("min_hours_remaining", 0.0))
+            if yes_ask is not None and thr < yes_ask <= thr_max:
+                # Bug-Fix: Markt muss genug Restlaufzeit haben (sonst bereits abgerechnet)
+                if min_hours > 0 and hours_left < min_hours:
+                    logger.debug(
+                        f"[Prediction] {ticker} – YES {yes_ask}¢ > {thr}¢ blockiert: "
+                        f"nur {hours_left:.1f}h verbleibend (mind. {min_hours}h nötig)"
+                    )
+                    return None
                 matched = True
-                reason  = f"YES ask {yes_ask}¢ > {thr}¢ → NO"
+                reason  = f"YES ask {yes_ask}¢ > {thr}¢ (≤ {thr_max}¢) → NO"
                 side    = "no"
 
         elif t == "yes_ask_between":

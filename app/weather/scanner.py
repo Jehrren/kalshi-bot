@@ -84,15 +84,22 @@ class WeatherScanner:
         self._min_vol        = float(scan_cfg.get("min_volume_usd", 25))
         self._max_concurrent = int(scan_cfg.get("max_concurrent_per_city", 2))
 
+        # City-Whitelist: nur diese Städte handeln (warme/stabile Klimata)
+        # Leer = alle Städte erlaubt
+        whitelist_raw = scan_cfg.get("city_whitelist", [])
+        self._city_whitelist: set[str] = set(whitelist_raw) if whitelist_raw else set()
+
         sys_cfg          = config.get("systems", {}).get(SYSTEM, {})
         self._bankroll   = float(sys_cfg.get("max_exposure_usd", 40.0))
 
         self._rules = WeatherRuleEngine(config)
 
-        # Ein Feed pro Stadt (dedupliziert über Koordinaten)
+        # Ein Feed pro Stadt (dedupliziert über Koordinaten, gefiltert durch Whitelist)
         self._feeds: dict[str, WeatherFeed] = {}
         seen_coords: set[str] = set()
         for series, (city, lat, lon, mtype) in WEATHER_SERIES_MAP.items():
+            if self._city_whitelist and city not in self._city_whitelist:
+                continue
             coord_key = f"{lat:.2f},{lon:.2f}"
             if coord_key not in seen_coords:
                 self._feeds[city] = WeatherFeed(
@@ -172,9 +179,12 @@ class WeatherScanner:
         now_utc  = datetime.now(timezone.utc)
         max_secs = self._max_close_hours * 3600
 
-        # Events per Weather-Serie abrufen
+        # Events per Weather-Serie abrufen (Whitelist-gefiltert)
         all_markets: list[dict] = []
         for series, (city, lat, lon, mtype) in WEATHER_SERIES_MAP.items():
+            # City-Whitelist: Skip wenn Stadt nicht auf der Liste
+            if self._city_whitelist and city not in self._city_whitelist:
+                continue
             try:
                 events = await loop.run_in_executor(
                     None,
@@ -347,26 +357,26 @@ class WeatherScanner:
             sell_price: int = max(1, entry_px - 1)
 
             if side == "no":
-                tp_target = int(entry_px * 2.0)
+                tp_target = int(entry_px * 1.7)
                 if no_bid and no_bid >= tp_target:
-                    exit_reason = f"Take-Profit: NO bid {no_bid}¢ ≥ 2× {entry_px}¢"
+                    exit_reason = f"Take-Profit: NO bid {no_bid}¢ ≥ 1.7× {entry_px}¢"
                     sell_price  = max(1, no_bid - 1)
-                elif mins_left < 30 and no_bid and no_bid < int(entry_px * 0.4):
+                elif mins_left < 30 and no_bid and no_bid < int(entry_px * 0.5):
                     exit_reason = (
                         f"Zeit-Stop: {mins_left:.0f}min verbl. | "
-                        f"NO bid {no_bid}¢ < 40% von {entry_px}¢"
+                        f"NO bid {no_bid}¢ < 50% von {entry_px}¢"
                     )
                     sell_price = max(1, no_bid or 1)
 
             elif side == "yes":
-                tp_target = min(95, int(entry_px * 2.0))
+                tp_target = min(95, int(entry_px * 1.7))
                 if yes_bid and yes_bid >= tp_target:
                     exit_reason = f"Take-Profit: YES bid {yes_bid}¢ ≥ {tp_target}¢"
                     sell_price  = max(1, yes_bid - 1)
-                elif mins_left < 30 and yes_bid and yes_bid < int(entry_px * 0.4):
+                elif mins_left < 30 and yes_bid and yes_bid < int(entry_px * 0.5):
                     exit_reason = (
                         f"Zeit-Stop: {mins_left:.0f}min verbl. | "
-                        f"YES bid {yes_bid}¢ < 40% von {entry_px}¢"
+                        f"YES bid {yes_bid}¢ < 50% von {entry_px}¢"
                     )
                     sell_price = max(1, yes_bid or 1)
 

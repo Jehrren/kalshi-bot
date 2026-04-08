@@ -125,6 +125,11 @@ class WeatherRuleEngine:
                 keyword = str(cond.get("value", "")).lower()
                 if keyword in title:
                     return []
+            if t == "ticker_not_contains":
+                fragment = str(cond.get("value", "")).upper()
+                if fragment in ticker.upper():
+                    logger.debug(f"[Weather] {ticker} SKIP – Ticker enthält '{fragment}'")
+                    return []
             if t == "yes_ask_between":
                 low  = int(cond.get("threshold_low", 0))
                 high = int(cond.get("threshold_high", 100))
