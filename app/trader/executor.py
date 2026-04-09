@@ -410,3 +410,4 @@ class TradeExecutor:
             rule_name=signal.rule_name,
             extra={"reason": signal.reason, "exit": True},
         )
+

@@ -207,6 +207,19 @@ class WeatherFeed:
                 members.append(float(vals[0]))
         return members
 
+    def bracket_probability(self, lower_f: float, upper_f: float, market_type: str = "high") -> float:
+        """
+        P(lower_f ≤ temp < upper_f) für Bracket-Märkte.
+
+        Methode: P(≥lower) - P(≥upper)
+        Korrekt für Kalshi Bracket-Slots (z.B. "60° to 61°" → lower=60, upper=62).
+        """
+        if lower_f <= 0 or upper_f <= lower_f:
+            return 0.0
+        p_low  = self.ensemble_probability(lower_f, market_type)
+        p_high = self.ensemble_probability(upper_f, market_type)
+        return max(0.0, min(1.0, p_low - p_high))
+
     def ensemble_probability(self, threshold_f: float, market_type: str = "high") -> float:
         """
         Berechnet Wahrscheinlichkeit dass Temperatur AT oder ABOVE threshold liegt.

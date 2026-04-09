@@ -41,13 +41,9 @@ class KalshiWSFeed:
     #  Verbindung                                                          #
     # ------------------------------------------------------------------ #
 
-    async def start(self) -> bool:
-        """
-        Baut WS-Verbindung auf, startet Listen-Task.
-        Gibt True zurück wenn erfolgreich.
-        """
+    async def _connect(self) -> bool:
+        """Baut nur die WS-Verbindung auf – ohne neuen Listen-Task zu spawnen."""
         try:
-            # WS-Pfad weicht von REST ab: /trade-api/ws/v2
             headers = self._client._sign_path("GET", WS_PATH)
             self._ws = await asyncio.wait_for(
                 websockets.connect(WS_URL, additional_headers=headers),
@@ -55,12 +51,21 @@ class KalshiWSFeed:
             )
             self._connected = True
             logger.info("[WSFeed] Verbunden mit Kalshi WebSocket")
-            self._listen_task = asyncio.create_task(self._listen(), name="ws_listen")
             return True
         except Exception as e:
             logger.warning(f"[WSFeed] Verbindung fehlgeschlagen – Fallback auf REST: {e}")
             self._connected = False
             return False
+
+    async def start(self) -> bool:
+        """
+        Baut WS-Verbindung auf, startet Listen-Task.
+        Gibt True zurück wenn erfolgreich.
+        """
+        if not await self._connect():
+            return False
+        self._listen_task = asyncio.create_task(self._listen(), name="ws_listen")
+        return True
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -120,8 +125,10 @@ class KalshiWSFeed:
         """Verarbeitet eingehende WS-Nachrichten, updated den Cache und reconnectet bei Verbindungsabbruch."""
         max_reconnects = 5
         reconnect_count = 0
+        _stable_threshold_s = 60
 
         while not self._stop_event.is_set():
+            connect_ts = time.time()
             try:
                 async for raw in self._ws:
                     if self._stop_event.is_set():
@@ -156,18 +163,27 @@ class KalshiWSFeed:
             except Exception as e:
                 logger.warning(f"[WSFeed] Listen-Fehler: {e}")
 
-            # Reconnect-Logik
+            # Reconnect-Logik (kein neuer Task – nur Socket neu aufbauen)
             if self._stop_event.is_set():
                 break
+            # Zähler zurücksetzen wenn Verbindung stabil genug war
+            if time.time() - connect_ts >= _stable_threshold_s:
+                reconnect_count = 0
             reconnect_count += 1
             if reconnect_count > max_reconnects:
                 logger.error(f"[WSFeed] Max. Reconnect-Versuche ({max_reconnects}) erreicht – gebe auf")
                 break
-            logger.info(f"[WSFeed] Reconnect {reconnect_count}/{max_reconnects} in 2s …")
-            await asyncio.sleep(2)
-            if not await self.start():
+            wait = min(2 * reconnect_count, 30)
+            logger.info(f"[WSFeed] Reconnect {reconnect_count}/{max_reconnects} in {wait}s …")
+            await asyncio.sleep(wait)
+            if not await self._connect():
                 logger.warning("[WSFeed] Reconnect fehlgeschlagen")
                 break
+            # Alle Ticker neu abonnieren
+            if self._subscribed:
+                old = list(self._subscribed)
+                self._subscribed.clear()
+                await self.subscribe(old)
 
         self._connected = False
 

@@ -69,19 +69,7 @@ class RiskManager:
 
     def refresh_positions(self):
         if self._dry_run:
-            # Abgelaufene Märkte ausbuchen (kein API-Call)
-            now = datetime.now(timezone.utc)
-            expired = [
-                t for t, ct_str in self._expiry.items()
-                if self._is_expired(ct_str, now)
-            ]
-            for t in expired:
-                exposure = self._positions.pop(t, 0.0)
-                self._expiry.pop(t, None)
-                self._details.pop(t, None)
-                if exposure > 0:
-                    logger.info(f"[Risk/DryRun] Markt abgelaufen, Position freigegeben: {t} (${exposure:.2f})")
-            self._save_positions()
+            self._pop_expired_positions()
             return
 
         try:
@@ -110,6 +98,39 @@ class RiskManager:
 
         except Exception as e:
             logger.warning(f"[Risk] Positions-Refresh fehlgeschlagen: {e}")
+
+    def pop_expired_positions(self) -> list[dict]:
+        """
+        Gibt abgelaufene Dry-Run-Positionen zurück und entfernt sie.
+
+        Jedes Dict enthält: ticker, exposure_usd, close_time + alle _details-Felder.
+        Gibt [] zurück wenn nicht im Dry-Run oder nichts abgelaufen.
+        """
+        if not self._dry_run:
+            return []
+        return self._pop_expired_positions()
+
+    def _pop_expired_positions(self) -> list[dict]:
+        now     = datetime.now(timezone.utc)
+        expired = [t for t, ct in self._expiry.items() if self._is_expired(ct, now)]
+        result  = []
+        for t in expired:
+            exposure = self._positions.pop(t, 0.0)
+            ct_str   = self._expiry.pop(t, "")
+            details  = self._details.pop(t, {})
+            if exposure > 0:
+                logger.info(
+                    f"[Risk/DryRun] Markt abgelaufen, Position freigegeben: {t} (${exposure:.2f})"
+                )
+            result.append({
+                "ticker":       t,
+                "exposure_usd": exposure,
+                "close_time":   ct_str,
+                **details,
+            })
+        if result:
+            self._save_positions()
+        return result
 
     def _is_expired(self, ct_str: str, now: datetime) -> bool:
         try:

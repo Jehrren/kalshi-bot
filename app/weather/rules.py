@@ -170,8 +170,11 @@ class WeatherRuleEngine:
         offset = int(act.get("limit_offset_cents", 1))
 
         matched, reason = False, ""
+        is_bracket = "-B" in ticker
 
         if t == "ensemble_edge" and feed is not None and yes_ask is not None:
+            if is_bracket:  # ensemble_edge berechnet P(≥X), nicht P(bracket) → skip
+                return None
             min_edge     = int(cond.get("min_edge_cents", 15))
             min_hours    = float(cond.get("min_hours_remaining", 2.0))
             max_hours    = float(cond.get("max_hours_remaining", 48))
@@ -213,6 +216,50 @@ class WeatherRuleEngine:
                 reason  = (
                     f"Ensemble P(NO)={1-ens_prob:.0%} vs. NO-Ask {no_ask}¢ | "
                     f"Edge +{edge_no}¢ | {city} {threshold_val:.0f}°F | "
+                    f"σ={spread_f:.1f}°F conf={confidence:.2f}"
+                )
+
+        elif t == "bracket_edge" and feed is not None and yes_ask is not None:
+            if not is_bracket:  # bracket_edge nur für Bracket-Märkte (-B Ticker)
+                return None
+            bracket_width = float(cond.get("bracket_width_f", 2.0))
+            min_edge      = int(cond.get("min_edge_cents", 15))
+            min_hours     = float(cond.get("min_hours_remaining", 2.0))
+            max_hours     = float(cond.get("max_hours_remaining", 48))
+            min_conf      = float(cond.get("min_confidence", 0.4))
+            max_spread    = float(cond.get("max_spread_f", 3.0))
+            market_type   = market.get("_market_type", "high")
+
+            if hours_left < min_hours or (max_hours > 0 and hours_left > max_hours):
+                return None
+            if confidence < min_conf:
+                return None
+            if spread_f > max_spread:
+                return None
+            if threshold_val <= 0:
+                return None
+
+            upper_f = threshold_val + bracket_width
+            ens_prob     = feed.bracket_probability(threshold_val, upper_f, market_type)
+            market_yes_p = yes_ask / 100.0
+
+            edge_yes = int(round((ens_prob - market_yes_p) * 100))
+            edge_no  = -edge_yes
+
+            if edge_yes >= min_edge:
+                matched = True
+                side    = "yes"
+                reason  = (
+                    f"Bracket P={ens_prob:.0%} vs. Markt {yes_ask}¢ | "
+                    f"Edge +{edge_yes}¢ | {city} {threshold_val:.0f}–{upper_f:.0f}°F | "
+                    f"σ={spread_f:.1f}°F conf={confidence:.2f}"
+                )
+            elif edge_no >= min_edge:
+                matched = True
+                side    = "no"
+                reason  = (
+                    f"Bracket P(NO)={1-ens_prob:.0%} vs. NO-Ask {no_ask}¢ | "
+                    f"Edge +{edge_no}¢ | {city} {threshold_val:.0f}–{upper_f:.0f}°F | "
                     f"σ={spread_f:.1f}°F conf={confidence:.2f}"
                 )
 
@@ -258,6 +305,16 @@ class WeatherRuleEngine:
 
         if not matched:
             return None
+
+        # Mindest-Payout-Schutz: NO bei 91¢+ → absoluter Gewinn zu gering
+        if side == "no":
+            max_no_ask = int(act.get("max_no_ask_cents", 0))
+            if max_no_ask > 0 and (no_ask or 0) > max_no_ask:
+                logger.debug(
+                    f"[Weather] {ticker} – NO {no_ask}¢ > max {max_no_ask}¢ "
+                    f"(ROI zu gering, Einsatz:{(no_ask or 0)/100:.2f}$, Win:<{(100-(no_ask or 0))/100:.2f}$)"
+                )
+                return None
 
         # Limit-Preis
         if side == "yes":

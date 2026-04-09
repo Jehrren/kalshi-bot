@@ -152,7 +152,10 @@ class CryptoScanner:
         now_ts = time.monotonic()
         if now_ts - self._last_exchange_check > 300:
             try:
-                status = await loop.run_in_executor(None, self._client.get_exchange_status)
+                status = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._client.get_exchange_status),
+                    timeout=20.0,
+                )
                 self._exchange_trading  = bool(status.get("trading_active", True))
                 self._last_exchange_check = now_ts
             except Exception as e:
@@ -162,7 +165,10 @@ class CryptoScanner:
 
         # BingX Feeds aktualisieren
         for feed in self._bingx_feeds.values():
-            await loop.run_in_executor(None, feed.refresh)
+            try:
+                await asyncio.wait_for(loop.run_in_executor(None, feed.refresh), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.debug("[Crypto/Scanner] BingX Feed Timeout – übersprungen")
 
         # Positions-State einmal laden und an alle Sub-Scans durchreichen
         cross_blocked_events: set[str]       = set()
@@ -223,7 +229,14 @@ class CryptoScanner:
             f = float(v)
             return int(round(f * 100)) if f <= 1.0 else int(round(f))
 
-        crypto_events = await loop.run_in_executor(None, self._client.get_all_crypto_events)
+        try:
+            crypto_events = await asyncio.wait_for(
+                loop.run_in_executor(None, self._client.get_all_crypto_events),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[Crypto/Scanner] get_all_crypto_events Timeout – Zyklus übersprungen")
+            return 0
         if not crypto_events:
             crypto_events = []
 
@@ -232,17 +245,22 @@ class CryptoScanner:
         if self._min15_on and self._min15_series:
             for series_ticker in self._min15_series:
                 try:
-                    min15_evs = await loop.run_in_executor(
-                        None,
-                        lambda s=series_ticker: self._client.get_events(
-                            series_ticker=s, with_nested_markets=True, status="open"
+                    min15_evs = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            lambda s=series_ticker: self._client.get_events(
+                                series_ticker=s, with_nested_markets=True, status="open"
+                            ),
                         ),
+                        timeout=15.0,
                     )
                     if min15_evs:
                         crypto_events.extend(min15_evs)
                         logger.info(
                             f"[Crypto/Scanner] {series_ticker}: {len(min15_evs)} 15M-Event(s) geladen"
                         )
+                except asyncio.TimeoutError:
+                    logger.debug(f"[Crypto/Scanner] 15M-Fetch {series_ticker} Timeout")
                 except Exception as e:
                     logger.debug(f"[Crypto/Scanner] 15M-Fetch {series_ticker} fehlgeschlagen: {e}")
 
@@ -292,7 +310,7 @@ class CryptoScanner:
                     try:
                         ct        = datetime.fromisoformat(close.replace("Z", "+00:00"))
                         mins_left = (ct - now).total_seconds() / 60
-                        if mins_left < 10 or mins_left > 15:
+                        if mins_left < 1.5 or mins_left > 15:
                             continue
                     except Exception:
                         continue
@@ -462,11 +480,14 @@ class CryptoScanner:
         signals = 0
         for evt_ticker in self._ladder_event_tickers:
             try:
-                mkt_data = await loop.run_in_executor(
-                    None,
-                    lambda t=evt_ticker: self._client.get_markets(
-                        event_ticker=t, status="open", limit=60
+                mkt_data = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda t=evt_ticker: self._client.get_markets(
+                            event_ticker=t, status="open", limit=60
+                        ),
                     ),
+                    timeout=15.0,
                 )
             except Exception:
                 continue
@@ -575,11 +596,14 @@ class CryptoScanner:
                 continue
 
             try:
-                mkt_data = await loop.run_in_executor(
-                    None,
-                    lambda t=evt_ticker: self._client.get_markets(
-                        event_ticker=t, status="open", limit=60
+                mkt_data = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda t=evt_ticker: self._client.get_markets(
+                            event_ticker=t, status="open", limit=60
+                        ),
                     ),
+                    timeout=15.0,
                 )
             except Exception:
                 continue
@@ -690,8 +714,9 @@ class CryptoScanner:
                 continue
 
             try:
-                market = await loop.run_in_executor(
-                    None, lambda t=ticker: self._client.get_market(t)
+                market = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda t=ticker: self._client.get_market(t)),
+                    timeout=15.0,
                 )
             except Exception:
                 continue

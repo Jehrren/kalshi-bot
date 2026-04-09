@@ -75,7 +75,6 @@ def kelly_count(price_cents: int, true_prob_win: float,
     f_star  = (true_prob_win * b - q) / b
     if f_star <= 0:
         return 0
-    # Untergrenze: wenn Kelly < 1% empfiehlt, kein Trade
     if f_star * fraction < 0.01:
         return 0
     bet_usd = f_star * fraction * bankroll_usd
@@ -180,11 +179,19 @@ class CryptoLadderRuleEngine:
 
         if t == "yes_ask_above":
             thr         = int(cond.get("threshold", 85))
+            thr_max     = int(cond.get("threshold_max", 0))  # 0 = kein Limit
             min_hours   = float(cond.get("min_hours_remaining", 2.0))
             max_hours   = float(cond.get("max_hours_remaining", 0))  # 0 = kein Limit
             min_over    = float(cond.get("spot_min_overshoot_pct", 1.0)) / 100
 
             if yes_ask is not None and yes_ask > thr:
+                # Obergrenze: bei zu extremen YES-Preisen kein Edge mehr
+                if thr_max > 0 and yes_ask > thr_max:
+                    logger.debug(
+                        f"[Crypto/Ladder] {ticker} – YES {yes_ask}¢ > {thr_max}¢ (threshold_max): "
+                        f"kein Edge bei extremer Marktmeinung"
+                    )
+                    return None
                 # Max-Zeit-Check: keine Langfrist-Wetten (Monats/Jahres-Märkte)
                 if max_hours > 0 and hours_left > max_hours:
                     logger.debug(
@@ -304,7 +311,8 @@ class CryptoLadderRuleEngine:
             max_cnt  = int(act.get("max_count", 15))
             if side == "no":
                 edge_p = no_ask or px
-                true_p = 1.0 - crypto_corrected_yes_prob(100 - edge_p)
+                yes_ref = yes_ask if yes_ask is not None else (100 - edge_p)
+                true_p = 1.0 - crypto_corrected_yes_prob(yes_ref)
             else:
                 edge_p = yes_ask or px
                 true_p = crypto_corrected_yes_prob(edge_p)
@@ -487,6 +495,9 @@ class CryptoZoneRuleEngine:
         event_ticker = market_low.get("event_ticker", "")
         close_time   = market_low.get("close_time", "")
 
+        profit_inzone = 200 - combined
+        loss_outzone  = combined - 100
+
         rsi_str = f" | RSI={rsi:.0f}" if rsi is not None else ""
         reason = (
             f"Zone YES@{yes_ask_low}¢+NO@{no_ask_high}¢={combined}¢ | "
@@ -635,8 +646,11 @@ class Crypto15MinRuleEngine:
         act  = rule.get("action", {})
         name = rule.get("name", "15M Spot-Convergence")
 
-        # Threshold aus Ticker parsen (-T Suffix)
+        # Threshold aus Ticker (-T Suffix) oder floor_strike (15M-Märkte ohne -T)
         threshold = self._ticker_threshold(ticker)
+        if threshold <= 0:
+            fs = market.get("floor_strike") or market.get("floor_strike_dollars")
+            threshold = float(fs) if fs else 0.0
         if threshold <= 0:
             return None
 
@@ -652,6 +666,10 @@ class Crypto15MinRuleEngine:
         min_mins = float(cond.get("min_mins_remaining", 2.0))
         max_mins = float(cond.get("max_mins_remaining", 12.0))
         if mins_left < min_mins or mins_left > max_mins:
+            logger.debug(
+                f"[15M/Spot] {ticker} außerhalb Zeitfenster: {mins_left:.1f}min "
+                f"(erlaubt {min_mins}-{max_mins}min)"
+            )
             return None
 
         # Stunden-Blacklist (UTC): bekannte toxische Zeitfenster
@@ -669,8 +687,9 @@ class Crypto15MinRuleEngine:
         min_distance_pct = float(cond.get("min_distance_pct", 0.4))
 
         if abs(distance_pct) < min_distance_pct:
-            logger.debug(
-                f"[15M/Spot] {ticker} Abstand {distance_pct:+.2f}% < {min_distance_pct}% – skip"
+            logger.info(
+                f"[15M/Spot] {ticker} Abstand {distance_pct:+.2f}% < {min_distance_pct}% Schwelle "
+                f"(spot={spot:.2f} vs thr={threshold:.2f}) – skip"
             )
             return None
 

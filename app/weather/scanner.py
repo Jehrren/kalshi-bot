@@ -82,7 +82,8 @@ class WeatherScanner:
         self._interval_s     = int(scan_cfg.get("interval_seconds", 300))
         self._max_close_hours = int(scan_cfg.get("max_close_hours", 48))
         self._min_vol        = float(scan_cfg.get("min_volume_usd", 25))
-        self._max_concurrent = int(scan_cfg.get("max_concurrent_per_city", 2))
+        self._max_concurrent       = int(scan_cfg.get("max_concurrent_per_city", 2))
+        self._max_brackets_per_event = int(scan_cfg.get("max_brackets_per_event", 2))
 
         # City-Whitelist: nur diese Städte handeln (warme/stabile Klimata)
         # Leer = alle Städte erlaubt
@@ -232,18 +233,27 @@ class WeatherScanner:
         # Nach Volumen sortieren
         all_markets.sort(key=lambda m: float(m.get("volume_24h_fp", 0) or 0), reverse=True)
 
-        # Positionen laden: Event-Dedup + Concurrent-Limit
-        active_event_tickers: set[str] = set()
+        # Positionen laden: Event-Dedup + Concurrent-Limit + Bracket-Counter
+        active_event_tickers: set[str] = set()    # normale Märkte: Event-Dedup
+        active_tickers: set[str] = set()          # Bracket-Märkte: Ticker-Dedup
+        bracket_count_by_event: dict[str, int] = defaultdict(int)
         concurrent_by_city: dict[str, int] = defaultdict(int)
         try:
             pos_data = json.loads(Path("data/positions.json").read_text())
             for p in pos_data.get("positions", []):
-                et_pos = p.get("event_ticker", "")
-                if et_pos:
+                et_pos     = p.get("event_ticker", "")
+                ticker_pos = p.get("ticker", "")
+                if ticker_pos:
+                    active_tickers.add(ticker_pos)
+                if "-B" in ticker_pos:
+                    # Bracket-Markt: zähle pro Event
+                    if et_pos:
+                        bracket_count_by_event[et_pos] += 1
+                elif et_pos:
+                    # Normaler Markt: Event-Dedup
                     active_event_tickers.add(et_pos)
                 if p.get("system") == SYSTEM:
-                    # Stadt aus Ticker-Prefix ableiten
-                    series_pfx = _series_from_ticker(p.get("ticker", ""))
+                    series_pfx = _series_from_ticker(ticker_pos)
                     city_name = series_to_city(series_pfx)
                     if city_name:
                         concurrent_by_city[city_name] += 1
@@ -265,9 +275,16 @@ class WeatherScanner:
             mtype  = market.get("_market_type", "high")
             et_mkt = market.get("event_ticker", "")
 
-            # Event-Dedup (systemübergreifend)
-            if et_mkt and et_mkt in active_event_tickers:
-                continue
+            # Dedup: Bracket vs. normale Märkte unterschiedlich behandeln
+            is_bracket = "-B" in ticker
+            if is_bracket:
+                if ticker in active_tickers:
+                    continue
+                if bracket_count_by_event.get(et_mkt, 0) >= self._max_brackets_per_event:
+                    continue
+            else:
+                if et_mkt and et_mkt in active_event_tickers:
+                    continue
 
             # Concurrent-Limit pro Stadt
             if concurrent_by_city.get(city, 0) >= self._max_concurrent:

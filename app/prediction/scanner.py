@@ -120,7 +120,10 @@ class PredictionScanner:
         # Exchange-Status alle 5 Minuten prüfen
         if now_ts - self._last_exchange_check > 300:
             try:
-                status = await loop.run_in_executor(None, self._client.get_exchange_status)
+                status = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._client.get_exchange_status),
+                    timeout=20.0,
+                )
                 self._exchange_trading      = bool(status.get("trading_active", True))
                 self._last_exchange_check   = now_ts
             except Exception as e:
@@ -159,10 +162,17 @@ class PredictionScanner:
 
     async def _fetch_events(self, loop) -> list:
         """Holt alle offenen Events gefiltert nach konfigurierten Kategorien."""
-        events = await loop.run_in_executor(
-            None,
-            lambda: self._client.get_all_events(status="open", with_nested_markets=True),
-        )
+        try:
+            events = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self._client.get_all_events(status="open", with_nested_markets=True),
+                ),
+                timeout=45.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[Prediction/Scanner] get_all_events Timeout – Zyklus übersprungen")
+            return []
         return [e for e in events if (e.get("category") or "").lower() in self._categories]
 
     # ── Entry-Scan ───────────────────────────────────────────────────── #
@@ -442,8 +452,9 @@ class PredictionScanner:
                 continue
 
             try:
-                market = await loop.run_in_executor(
-                    None, lambda t=ticker: self._client.get_market(t)
+                market = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda t=ticker: self._client.get_market(t)),
+                    timeout=15.0,
                 )
             except Exception:
                 continue

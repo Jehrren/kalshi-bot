@@ -129,12 +129,12 @@
         },
         {
             "name": "Time Decay – Überschätztes YES mit langer Laufzeit → NO",
-            "description": "Märkte mit 14+ Tagen: YES 20–45¢ hat besten Theta-Edge ohne zu extremes Risiko.",
+            "description": "Nur bei 20+ Tagen und YES 25–45¢: genug Theta-Edge, kein pennyantes ROI-Problem mehr.",
             "enabled": true,
             "condition": {
                 "type": "time_decay_no",
-                "min_days_remaining": 14,
-                "yes_ask_min": 20,
+                "min_days_remaining": 20,
+                "yes_ask_min": 25,
                 "yes_ask_max": 45
             },
             "action": { "side": "no", "order_type": "limit", "count": 3, "limit_offset_cents": 1 }
@@ -198,15 +198,16 @@
             "action": { "side": "SKIP" }
         },
         {
-            "name": "Leiter – YES >85% → NO kaufen (Tail-Risiko wird unterschätzt)",
-            "description": "NUR wenn Spot > Schwelle + 1% UND > 2h verbleibend.",
+            "name": "Leiter – YES 85–96% → NO kaufen (Tail-Risiko wird unterschätzt)",
+            "description": "NUR wenn Spot > Schwelle + 2% UND 2–36h verbleibend. threshold_max=96: bei 97¢+ kein ausreichender Edge. max_hours=36: Tages- und morgige Märkte eingeschlossen (intraday <8h haben YES>96¢ blockiert durch threshold_max).",
             "enabled": true,
             "condition": {
                 "type": "yes_ask_above",
                 "threshold": 85,
-                "spot_min_overshoot_pct": 1.0,
+                "threshold_max": 96,
+                "spot_min_overshoot_pct": 2.0,
                 "min_hours_remaining": 2.0,
-                "max_hours_remaining": 168
+                "max_hours_remaining": 36
             },
             "action": {
                 "side": "no", "order_type": "limit", "limit_offset_cents": 1,
@@ -311,6 +312,7 @@
         "max_close_hours": 48,
         "min_volume_usd": 25,
         "max_concurrent_per_city": 2,
+        "max_brackets_per_event": 2,
         "feed_refresh_seconds": 300,
         "city_whitelist": ["Miami", "New York", "Boston", "Seattle", "San Antonio", "Atlanta"]
     },
@@ -318,8 +320,8 @@
     "weather_rules": [
         {
             "name": "Filter – Bracket-Kontrakte (-B) ausschließen",
-            "description": "Bracket-Märkte sind mit ensemble_probability() mathematisch nicht sauber bewertbar (P(≥X) ≠ P(in [X, X+1])). Daten bestätigen: 36% WR, -$19 Verlust.",
-            "enabled": true,
+            "description": "DEAKTIVIERT: bracket_edge Regel übernimmt korrekte P(bracket)-Berechnung. ensemble_edge ignoriert -B-Märkte intern.",
+            "enabled": false,
             "condition": { "type": "ticker_not_contains", "value": "-B" },
             "action": { "side": "SKIP" }
         },
@@ -334,6 +336,30 @@
             "enabled": true,
             "condition": { "type": "yes_ask_between", "threshold_low": 43, "threshold_high": 57 },
             "action": { "side": "SKIP" }
+        },
+        {
+            "name": "Bracket-Edge – P(bracket) vs. Marktpreis",
+            "description": "Bracket-Märkte (-BX Ticker): P(X ≤ temp < X+2) aus GFS-Ensemble. Korrekte Formel: P(≥X) - P(≥X+2). Höhere Konfidenz und engerer Spread nötig als bei normalen Märkten.",
+            "enabled": true,
+            "condition": {
+                "type": "bracket_edge",
+                "bracket_width_f": 2.0,
+                "min_edge_cents": 15,
+                "min_hours_remaining": 2.0,
+                "max_hours_remaining": 48,
+                "min_confidence": 0.4,
+                "max_spread_f": 3.0
+            },
+            "action": {
+                "side": "auto",
+                "order_type": "limit",
+                "limit_offset_cents": 1,
+                "kelly_sizing": true,
+                "kelly_fraction": 0.20,
+                "min_count": 1,
+                "max_count": 6,
+                "max_no_ask_cents": 90
+            }
         },
         {
             "name": "Ensemble-Edge – Probability-Gap ≥ 15¢",
@@ -354,7 +380,8 @@
                 "kelly_sizing": true,
                 "kelly_fraction": 0.25,
                 "min_count": 1,
-                "max_count": 8
+                "max_count": 8,
+                "max_no_ask_cents": 90
             }
         },
         {
@@ -375,7 +402,8 @@
                 "kelly_sizing": true,
                 "kelly_fraction": 0.25,
                 "min_count": 1,
-                "max_count": 8
+                "max_count": 8,
+                "max_no_ask_cents": 90
             }
         },
         {
