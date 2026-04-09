@@ -73,6 +73,7 @@ class PredictionScanner:
         self._stop_event            = asyncio.Event()
         self._exit_pending:  set[str]       = set()
         self._prev_yes_ask:  dict[str, int] = {}  # für Überreaktions-Erkennung
+        self._price_history: dict[str, list[tuple[float, int]]] = {}  # 2h Preis-Historie pro Ticker
         self._exchange_trading:     bool    = True
         self._last_exchange_check:  float   = 0.0
 
@@ -228,16 +229,26 @@ class PredictionScanner:
             if et_mkt and et_mkt in active_event_tickers:
                 continue
 
-            # Überreaktions-Delta berechnen und ins market-Dict injizieren
+            # Überreaktions-Delta + 2h Preis-Historie berechnen und ins market-Dict injizieren
             ya_raw = market.get("yes_ask_dollars") or market.get("yes_ask")
             if ya_raw is not None:
                 try:
-                    ya_f = float(ya_raw)
-                    ya   = int(round(ya_f * 100)) if ya_f <= 1.0 else int(round(ya_f))
+                    ya_f       = float(ya_raw)
+                    ya         = int(round(ya_f * 100)) if ya_f <= 1.0 else int(round(ya_f))
+                    now_ts_abs = time.time()
+                    # Überreaktions-Delta
                     prev = self._prev_yes_ask.get(ticker)
                     if prev is not None:
                         market = {**market, "_overreaction_delta": ya - prev}
                     self._prev_yes_ask[ticker] = ya
+                    # 2h Preis-Historie (Regime-Filter)
+                    cutoff  = now_ts_abs - 7200
+                    history = [e for e in self._price_history.get(ticker, []) if e[0] >= cutoff]
+                    history.append((now_ts_abs, ya))
+                    self._price_history[ticker] = history
+                    if len(history) >= 2:
+                        prices = [e[1] for e in history]
+                        market = {**market, "_price_change_2h": max(prices) - min(prices)}
                 except (ValueError, TypeError):
                     pass
 

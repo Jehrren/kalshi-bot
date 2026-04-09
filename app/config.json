@@ -35,7 +35,7 @@
         "interval_seconds": 60,
         "max_close_days": 30,
         "min_volume_usd": 100,
-        "overreaction_delta_cents": 8,
+        "overreaction_delta_cents": 5,
         "zone_enabled": true,
         "zone_max_combined_cents": 95,
         "zone_min_hours_remaining": 3.0,
@@ -112,14 +112,14 @@
             }
         },
         {
-            "name": "Gut kalibrierte Zone (73–82%) → YES kaufen (mind. 4h Restlaufzeit)",
-            "description": "Beste Kalibrierung laut Polymarket-Daten. NUR wenn > 4h verbleibend. Kelly 0.40 (100% WR bewiesen).",
+            "name": "Gut kalibrierte Zone (73–82%) → YES kaufen (mind. 2h Restlaufzeit)",
+            "description": "Beste Kalibrierung laut Polymarket-Daten. NUR wenn > 2h verbleibend. Kelly 0.40 (100% WR bewiesen). Reduziert von 4h→2h da die meisten Märkte <4h Restlaufzeit haben.",
             "enabled": true,
             "condition": {
                 "type": "yes_ask_between",
                 "threshold_low": 73,
                 "threshold_high": 82,
-                "min_hours_remaining": 4.0
+                "min_hours_remaining": 2.0
             },
             "action": {
                 "side": "yes", "order_type": "limit", "limit_offset_cents": 1,
@@ -129,8 +129,8 @@
         },
         {
             "name": "Time Decay – Überschätztes YES mit langer Laufzeit → NO",
-            "description": "Nur bei 20+ Tagen und YES 25–45¢: genug Theta-Edge, kein pennyantes ROI-Problem mehr.",
-            "enabled": true,
+            "description": "DEAKTIVIERT: 6 Signale in 29h mit 0% Win-Rate. Prediction-Märkte trendet mit News, kein Mean-Reversion-Edge bei 20+ Tagen.",
+            "enabled": false,
             "condition": {
                 "type": "time_decay_no",
                 "min_days_remaining": 20,
@@ -216,14 +216,14 @@
             }
         },
         {
-            "name": "Leiter – YES 73–82% → YES kaufen (RSI überverkauft + mind. 4h)",
-            "description": "NUR wenn RSI-Signal überverkauft UND > 4h verbleibend. Kelly 0.40 (100% WR bewiesen).",
+            "name": "Leiter – YES 73–82% → YES kaufen (RSI überverkauft + mind. 2h)",
+            "description": "NUR wenn RSI-Signal überverkauft UND > 2h verbleibend. Kelly 0.40 (100% WR bewiesen). Reduziert von 4h→2h.",
             "enabled": true,
             "condition": {
                 "type": "yes_ask_between",
                 "threshold_low": 73,
                 "threshold_high": 82,
-                "min_hours_remaining": 4.0,
+                "min_hours_remaining": 2.0,
                 "max_hours_remaining": 168,
                 "require_rsi_oversold": true,
                 "rsi_oversold_threshold": 40
@@ -408,13 +408,13 @@
         },
         {
             "name": "Gut kalibrierte Zone (73–82%) → YES kaufen",
-            "description": "Nur bei hoher Forecast-Konfidenz (niedriger Ensemble-Spread). Kelly 0.40.",
+            "description": "Nur bei hoher Forecast-Konfidenz (niedriger Ensemble-Spread). Kelly 0.40. Reduziert von 4h→2h.",
             "enabled": true,
             "condition": {
                 "type": "yes_ask_between",
                 "threshold_low": 73,
                 "threshold_high": 82,
-                "min_hours_remaining": 4.0,
+                "min_hours_remaining": 2.0,
                 "max_spread_f": 4.0
             },
             "action": {

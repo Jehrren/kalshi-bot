@@ -106,6 +106,7 @@ class CryptoScanner:
         self._exit_pending:        set[str]   = set()
         self._exchange_trading:    bool       = True
         self._last_exchange_check: float      = 0.0
+        self._warmup_last_logged:  dict[str, float] = {}  # RSI-Warmup-Log Throttle
 
         logger.info(
             f"[Crypto/Scanner] Gestartet | Intervall: {self._interval_s}s | "
@@ -209,9 +210,16 @@ class CryptoScanner:
         bankroll_usd = self._bankroll
 
         sym_ctxs: dict[str, dict] = {}
+        now_ts = time.monotonic()
         for sym, feed in self._bingx_feeds.items():
             if feed.is_ready():
                 sym_ctxs[sym] = {**feed.context(), "bankroll_usd": bankroll_usd}
+            else:
+                last = self._warmup_last_logged.get(sym, 0.0)
+                if now_ts - last >= 60.0:
+                    candles = len(feed._candles)
+                    logger.info(f"[Crypto/Warmup] {sym}: RSI nicht bereit – {candles}/30 Kerzen")
+                    self._warmup_last_logged[sym] = now_ts
 
         def _thr_val(ticker: str) -> float:
             for sep in ("-T", "-B"):

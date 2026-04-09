@@ -172,11 +172,10 @@ class PredictionRuleEngine:
             thr_max   = int(cond.get("threshold_max", 100))
             min_hours = float(cond.get("min_hours_remaining", 0.0))
             if yes_ask is not None and thr < yes_ask <= thr_max:
-                # Bug-Fix: Markt muss genug Restlaufzeit haben (sonst bereits abgerechnet)
                 if min_hours > 0 and hours_left < min_hours:
-                    logger.debug(
-                        f"[Prediction] {ticker} – YES {yes_ask}¢ > {thr}¢ blockiert: "
-                        f"nur {hours_left:.1f}h verbleibend (mind. {min_hours}h nötig)"
+                    logger.info(
+                        f"[Prediction/Skip] {ticker} – Regel '{name}': "
+                        f"YES {yes_ask}¢ passt, aber {hours_left:.1f}h < {min_hours}h Mindest-Laufzeit"
                     )
                     return None
                 matched = True
@@ -188,10 +187,18 @@ class PredictionRuleEngine:
             high      = int(cond.get("threshold_high", 100))
             min_hours = float(cond.get("min_hours_remaining", 0.0))
             if yes_ask is not None and low <= yes_ask <= high:
+                # Regime-Filter: kein Trade wenn Markt in letzten 2h >10¢ bewegt hat
+                price_change_2h = int(market.get("_price_change_2h", 0))
+                if price_change_2h > 10:
+                    logger.info(
+                        f"[Prediction/Skip] {ticker} – Regel '{name}': "
+                        f"Regime-Filter aktiv | Preisbewegung {price_change_2h}¢ in 2h > 10¢ (News-Event?)"
+                    )
+                    return None
                 if min_hours > 0 and hours_left < min_hours:
-                    logger.debug(
-                        f"[Prediction] {ticker} – YES {yes_ask}¢ passt Regel '{name}', "
-                        f"aber nur {hours_left:.1f}h verbleibend (mind. {min_hours}h nötig)"
+                    logger.info(
+                        f"[Prediction/Skip] {ticker} – Regel '{name}': "
+                        f"YES {yes_ask}¢ in [{low}–{high}]¢ passt, aber {hours_left:.1f}h < {min_hours}h Mindest-Laufzeit"
                     )
                     return None
                 matched = True
@@ -210,6 +217,11 @@ class PredictionRuleEngine:
                         matched = True
                         reason  = f"Time-Decay: YES={yes_ask}¢ | {days}d verbleibend"
                         side    = "no"
+                    else:
+                        logger.debug(
+                            f"[Prediction/Skip] {ticker} – Time-Decay: YES={yes_ask}¢ passt, "
+                            f"aber nur {days}d < {min_days}d"
+                        )
                 except Exception:
                     pass
 
@@ -226,6 +238,11 @@ class PredictionRuleEngine:
                 matched = True
                 side    = "yes"
                 reason  = f"Überreaktion: YES {yes_ask}¢ (-{abs(delta)}¢) → YES kontrarian"
+            elif yes_ask is not None and abs(delta) > 0:
+                logger.debug(
+                    f"[Prediction/Skip] {ticker} – Überreaktion: delta={delta:+d}¢ "
+                    f"(mind. ±{min_delta}¢ nötig) | YES={yes_ask}¢"
+                )
 
         if not matched:
             return None
