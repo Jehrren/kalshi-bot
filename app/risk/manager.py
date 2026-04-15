@@ -12,6 +12,7 @@ Dry-Run-Modus:
 - Positions-Status wird in data/positions.json gespeichert (für UI)
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -32,10 +33,18 @@ class RiskManager:
         self.max_position_usd       = float(risk.get("max_position_usd", 50.0))
         self.max_total_exposure_usd = float(risk.get("max_total_exposure_usd", 200.0))
         self.max_open_positions     = int(risk.get("max_open_positions", 0))  # 0 = kein Limit
+        # Globaler Einzeltrade-Cap: max. X% des Startkapitals pro Trade.
+        # Verhindert katastrophale Einzelverluste (z.B. 85¢×10 = $8.50 = 4.3% bei $200).
+        starting_bal = float(config.get("settlement", {}).get("starting_balance_usd", 200.0))
+        self._max_single_trade_pct = float(risk.get("max_single_trade_pct", 3.0))
+        self._max_single_trade_usd = starting_bal * self._max_single_trade_pct / 100
         self._positions: dict[str, float] = {}   # ticker → exposure USD
         self._expiry:    dict[str, str]   = {}   # ticker → ISO close_time (dry-run only)
         self._details:   dict[str, dict]  = {}   # ticker → volle Positions-Details
         self._settled:   set[str]         = set() # bereits abgerechnete Ticker (kein Re-Entry)
+        # Gemeinsamer Lock: schützt alle State-Mutationen gegen gleichzeitige
+        # Zugriffe aus Executor-Task und Settlement-Task.
+        self.lock = asyncio.Lock()
         if self._dry_run:
             self._load_positions_from_file()
 
@@ -170,6 +179,11 @@ class RiskManager:
         except Exception as e:
             logger.debug(f"[Risk] positions.json konnte nicht geschrieben werden: {e}")
 
+    async def save_positions_safe(self):
+        """Thread-sichere Version von _save_positions() – nutzt den shared Lock."""
+        async with self.lock:
+            self._save_positions()
+
     def set_settled_tickers(self, tickers: set[str]):
         """Initialisiert die settled-Liste (beim Bot-Start vom SettlementTracker aufgerufen)."""
         self._settled = set(tickers)
@@ -223,6 +237,12 @@ class RiskManager:
                             system: str = "", event_ticker: str = "") -> tuple[bool, str]:
         exposure_usd = count * price_cents / 100
         current      = self._positions.get(ticker, 0.0)
+
+        # Globaler Einzeltrade-Cap: kein Trade darf mehr als X% des Startkapitals riskieren
+        if exposure_usd > self._max_single_trade_usd:
+            return False, (f"Einzeltrade-Cap: ${exposure_usd:.2f} > "
+                           f"${self._max_single_trade_usd:.2f} "
+                           f"({self._max_single_trade_pct:.0f}% von Startkapital)")
 
         # Bereits abgerechnete Ticker nicht erneut eröffnen (Zombie-Schutz)
         if ticker in self._settled:

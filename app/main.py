@@ -179,7 +179,7 @@ async def main():
     async def heartbeat_loop():
         while not shutdown_event.is_set():
             try:
-                risk._save_positions()
+                await risk.save_positions_safe()
             except Exception as e:
                 logger.debug(f"[Main/Heartbeat] Fehler: {e}")
             try:

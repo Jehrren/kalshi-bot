@@ -28,6 +28,7 @@ from crypto.rules import CryptoLadderRuleEngine, Crypto15MinRuleEngine, CryptoZo
 from feeds.bingx_feed import BingXFeed, SERIES_SYMBOL_MAP, series_to_symbol
 from logger.trade_logger import TradeLogger
 from trader.executor import Signal
+from utils.market import ticker_threshold, parse_price_cents
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +48,6 @@ def _to_executor_signal(cs: CryptoSignal) -> Signal:
         meta        = {**cs.meta, "system": SYSTEM},
         track       = cs.track,
     )
-
-
-def _cents(val) -> int:
-    f = float(val)
-    return int(round(f * 100)) if f <= 1.0 else int(round(f))
 
 
 class CryptoScanner:
@@ -221,22 +217,6 @@ class CryptoScanner:
                     logger.info(f"[Crypto/Warmup] {sym}: RSI nicht bereit – {candles}/30 Kerzen")
                     self._warmup_last_logged[sym] = now_ts
 
-        def _thr_val(ticker: str) -> float:
-            for sep in ("-T", "-B"):
-                if sep in ticker:
-                    try:
-                        return float(ticker.split(sep)[-1])
-                    except Exception:
-                        pass
-            return 0.0
-
-        def _pc(m: dict, key: str) -> Optional[int]:
-            v = m.get(key + "_dollars") or m.get(key)
-            if v is None:
-                return None
-            f = float(v)
-            return int(round(f * 100)) if f <= 1.0 else int(round(f))
-
         try:
             crypto_events = await asyncio.wait_for(
                 loop.run_in_executor(None, self._client.get_all_crypto_events),
@@ -337,11 +317,11 @@ class CryptoScanner:
                     # Distanz-Filter
                     sym = series_to_symbol(series)
                     spot_ctx = sym_ctxs.get(sym, {}) if sym else {}
-                    spot_p   = spot_ctx.get("btc_price")
+                    spot_p   = spot_ctx.get("spot_price") or spot_ctx.get("btc_price")
                     if spot_p and spot_p > 0:
-                        thr = _thr_val(m.get("ticker", ""))
+                        thr = ticker_threshold(m.get("ticker", ""))
                         if thr > 0:
-                            change_abs   = abs(spot_ctx.get("btc_change_15min", 0) or 0)
+                            change_abs   = abs(spot_ctx.get("spot_change_15min") or spot_ctx.get("btc_change_15min", 0) or 0)
                             adaptive_pct = 2.0 + min(change_abs * 0.5, 2.0)
                             # Asymmetrischer Filter:
                             # – 5% unter Spot: erfasst YES>85¢-Zone (threshold 2–5% unter Spot)
@@ -355,7 +335,7 @@ class CryptoScanner:
         # MVE Combo ausschließen
         markets = [m for m in markets if not m.get("ticker", "").startswith("KXMVECROSSCATEGORY")]
         # Mindest-NO-Preis ≥ 5¢
-        markets = [m for m in markets if (_pc(m, "no_ask") or 0) >= 5]
+        markets = [m for m in markets if (parse_price_cents(m, "no_ask") or 0) >= 5]
         # Nach Volumen sortieren – höchste Liquidität zuerst
         markets.sort(key=lambda m: float(m.get("volume_24h_fp", 0) or 0), reverse=True)
 
@@ -472,19 +452,6 @@ class CryptoScanner:
         if not self._ladder_event_tickers:
             return 0
 
-        def _price(m, key):
-            v = m.get(key + "_dollars") or m.get(key)
-            if v is None:
-                return None
-            f = float(v)
-            return int(round(f * 100)) if f <= 1.0 else int(round(f))
-
-        def _threshold(ticker: str) -> float:
-            try:
-                return float(ticker.split("-T")[-1].replace(".99", ""))
-            except Exception:
-                return 0.0
-
         signals = 0
         for evt_ticker in self._ladder_event_tickers:
             try:
@@ -502,11 +469,11 @@ class CryptoScanner:
 
             valid = []
             for m in mkt_data.get("markets", []):
-                ya  = _price(m, "yes_ask")
-                na  = _price(m, "no_ask")
+                ya  = parse_price_cents(m, "yes_ask")
+                na  = parse_price_cents(m, "no_ask")
                 vol = float(m.get("volume_24h_fp", 0) or 0)
                 if ya and na and vol >= 500:
-                    valid.append((m, _threshold(m.get("ticker", "")), ya, na))
+                    valid.append((m, ticker_threshold(m.get("ticker", "")), ya, na))
 
             if len(valid) < 2:
                 continue
@@ -579,22 +546,6 @@ class CryptoScanner:
             if feed.is_ready():
                 sym_ctxs[sym] = {**feed.context(), "bankroll_usd": bankroll_usd}
 
-        def _price(m, key):
-            v = m.get(key + "_dollars") or m.get(key)
-            if v is None:
-                return None
-            f = float(v)
-            return int(round(f * 100)) if f <= 1.0 else int(round(f))
-
-        def _threshold(ticker: str) -> float:
-            for sep in ("-T", "-B"):
-                if sep in ticker:
-                    try:
-                        return float(ticker.split(sep)[-1])
-                    except Exception:
-                        pass
-            return 0.0
-
         signals = 0
         for evt_ticker in self._ladder_event_tickers:
             # Events mit Fremdpositionen oder bereits voll besetzten Crypto-Positionen überspringen
@@ -628,10 +579,10 @@ class CryptoScanner:
             # Märkte filtern und nach Schwelle sortieren
             valid = []
             for m in mkt_data.get("markets", []):
-                ya  = _price(m, "yes_ask")
-                na  = _price(m, "no_ask")
+                ya  = parse_price_cents(m, "yes_ask")
+                na  = parse_price_cents(m, "no_ask")
                 vol = float(m.get("volume_24h_fp", 0) or 0)
-                thr = _threshold(m.get("ticker", ""))
+                thr = ticker_threshold(m.get("ticker", ""))
                 if ya is not None and na is not None and vol >= 500 and thr > 0:
                     m["event_ticker"] = evt_ticker
                     valid.append((m, thr, ya, na))
@@ -731,17 +682,10 @@ class CryptoScanner:
             if not market:
                 continue
 
-            def _pc(key: str) -> Optional[int]:
-                v = market.get(key + "_dollars") or market.get(key)
-                if v is None:
-                    return None
-                f = float(v)
-                return int(round(f * 100)) if f <= 1.0 else int(round(f))
-
-            yes_ask = _pc("yes_ask")
-            yes_bid = _pc("yes_bid")
-            no_ask  = _pc("no_ask")
-            no_bid  = _pc("no_bid")
+            yes_ask = parse_price_cents(market, "yes_ask")
+            yes_bid = parse_price_cents(market, "yes_bid")
+            no_ask  = parse_price_cents(market, "no_ask")
+            no_bid  = parse_price_cents(market, "no_bid")
 
             exit_reason: Optional[str] = None
             sell_price:  int           = entry_px

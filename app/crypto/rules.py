@@ -13,17 +13,18 @@ Ladder-Regeln (crypto_ladder_rules):
   yes_ask_between (SKIP): 50/50-Filter
 
 15-Min-Regeln (crypto_15min_rules):
-  btc_15min_mean_reversion : RSI-gestützte Mean-Reversion
+  btc_15min_spot_convergence : Spot-Distance Convergence
 """
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from crypto.models import CryptoSignal, SYSTEM  # noqa: F401 – re-exportiert für Rückwärtskompatibilität
+from crypto.rules_15min import Crypto15MinRuleEngine  # noqa: F401 – re-exportiert
+from utils.kelly import kelly_count
+from utils.market import ticker_threshold, hours_remaining as market_hours_remaining, parse_price_cents
 
-SYSTEM = "crypto"
+logger = logging.getLogger(__name__)
 
 
 # ── Kelly Utilities ──────────────────────────────────────────────────── #
@@ -55,50 +56,10 @@ def crypto_corrected_yes_prob(yes_ask_cents: int) -> float:
     return p
 
 
-def kelly_count(price_cents: int, true_prob_win: float,
-                bankroll_usd: float, fraction: float = 0.25,
-                min_count: int = 1, max_count: int = 15,
-                fee_pct: float = 1.0) -> int:
-    """Quarter-Kelly Position Sizing mit Gebühren-Abzug.
-
-    fee_pct: Kalshi Settlement-Fee in Prozent (default 1.0 = 1%).
-    Reduziert den effektiven Gewinn und damit den Kelly-Faktor.
-    Gibt 0 zurück wenn kein positiver Edge nach Gebühren besteht.
-    """
-    cost = price_cents / 100.0
-    if cost <= 0 or cost >= 1 or true_prob_win <= 0:
-        return min_count
-    fee   = fee_pct / 100.0
-    # Netto-Gewinn nach Fee: (1 - cost) * (1 - fee)
-    b       = (1.0 - cost) * (1.0 - fee) / cost
-    q       = 1.0 - true_prob_win
-    f_star  = (true_prob_win * b - q) / b
-    if f_star <= 0:
-        return 0
-    if f_star * fraction < 0.01:
-        return 0
-    bet_usd = f_star * fraction * bankroll_usd
-    count   = int(bet_usd / cost)
-    return max(min_count, min(max_count, count))
+# kelly_count wird aus utils.kelly importiert (max_count default=15 für Crypto-System)
 
 
-# ── Signal ───────────────────────────────────────────────────────────── #
-
-@dataclass
-class CryptoSignal:
-    ticker:      str
-    rule_name:   str
-    side:        str
-    action:      str
-    price_cents: int
-    count:       int
-    reason:      str
-    system:      str = SYSTEM
-    meta:        dict = field(default_factory=dict)
-    track:       str = "crypto"
-
-
-# ── Rule Engine ──────────────────────────────────────────────────────── #
+# ── Rule Engines ─────────────────────────────────────────────────────── #
 
 class CryptoLadderRuleEngine:
     def __init__(self, config: dict):
@@ -118,7 +79,7 @@ class CryptoLadderRuleEngine:
         close_str = market.get("close_time", "")
         hours_left = self._hours_remaining(close_str)
         ctx       = context or {}
-        spot      = ctx.get("btc_price")  # Spot-Preis (BTC, ETH, etc.) – key heißt immer btc_price
+        spot      = ctx.get("spot_price") or ctx.get("btc_price")  # spot_price bevorzugt (asset-agnostisch)
         rsi       = ctx.get("bingx_rsi")
         bankroll  = float(ctx.get("bankroll_usd", 80.0))
 
@@ -298,6 +259,17 @@ class CryptoLadderRuleEngine:
                 )
                 return None
 
+        # Mindest-NO-Preis: Trades unter 12¢ haben historisch 18% WR (≈ breakeven,
+        # hohe Varianz). Filterbar pro Regel via min_no_ask_cents (default: 0 = aus).
+        if side == "no":
+            min_no = int(cond.get("min_no_ask_cents", 0))
+            if min_no > 0 and no_ask is not None and no_ask < min_no:
+                logger.debug(
+                    f"[Crypto/Ladder] {ticker} – NO {no_ask}¢ < min {min_no}¢ "
+                    f"(ROI bei Kleinstpreisen zu variabel)"
+                )
+                return None
+
         # Limit-Preis
         if side == "yes":
             px = max(1, min(99, (yes_ask or 50) + offset))
@@ -347,32 +319,13 @@ class CryptoLadderRuleEngine:
         )
 
     def _price(self, market: dict, key: str) -> Optional[int]:
-        v = market.get(key + "_dollars") or market.get(key)
-        if v is None:
-            return None
-        try:
-            f = float(v)
-            return int(round(f * 100)) if f <= 1.0 else int(round(f))
-        except (ValueError, TypeError):
-            return None
+        return parse_price_cents(market, key)
 
     def _hours_remaining(self, close_str: str) -> float:
-        if not close_str:
-            return float("inf")
-        try:
-            ct = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-            return max(0.0, (ct - datetime.now(timezone.utc)).total_seconds() / 3600)
-        except Exception:
-            return float("inf")
+        return market_hours_remaining(close_str)
 
     def _ticker_threshold(self, ticker: str) -> float:
-        for sep in ("-T", "-B"):
-            if sep in ticker:
-                try:
-                    return float(ticker.split(sep)[-1])
-                except Exception:
-                    pass
-        return 0.0
+        return ticker_threshold(ticker)
 
 
 class CryptoZoneRuleEngine:
@@ -555,321 +508,10 @@ class CryptoZoneRuleEngine:
         ]
 
     def _price(self, market: dict, key: str) -> Optional[int]:
-        v = market.get(key + "_dollars") or market.get(key)
-        if v is None:
-            return None
-        try:
-            f = float(v)
-            return int(round(f * 100)) if f <= 1.0 else int(round(f))
-        except (ValueError, TypeError):
-            return None
+        return parse_price_cents(market, key)
 
     def _hours_remaining(self, close_str: str) -> float:
-        if not close_str:
-            return float("inf")
-        try:
-            ct = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-            return max(0.0, (ct - datetime.now(timezone.utc)).total_seconds() / 3600)
-        except Exception:
-            return float("inf")
+        return market_hours_remaining(close_str)
 
 
-class Crypto15MinRuleEngine:
-    """
-    Rule Engine für BTC/ETH/SOL/XRP/DOGE/BNB 15-Min-Märkte.
-
-    Unterstützte Regel-Typen:
-      - btc_15min_spot_convergence: Spot-Distance Convergence (NEU, ersetzt Mean-Reversion)
-      - btc_15min_mean_reversion: Mean Reversion (DEPRECATED, -42$ Verlust bei 16% WR)
-
-    Spot-Distance Convergence Logik:
-      1. Parse Threshold aus Ticker (z.B. KXBTC15M-...-T71500 → 71500)
-      2. Hole BingX Spot-Preis
-      3. Berechne signierten Abstand: (spot - threshold) / threshold
-      4. Wenn |Abstand| > min_distance_pct UND Restlaufzeit im Fenster:
-         - Spot ÜBER Schwelle → kauf YES (markt-in-the-money)
-         - Spot UNTER Schwelle → kauf NO (markt-in-the-money)
-      5. Kelly-Sizing basierend auf Abstand (größerer Abstand = höhere Konfidenz)
-    """
-
-    def __init__(self, config: dict):
-        self._rules = [
-            r for r in config.get("crypto_15min_rules", [])
-            if r.get("enabled", True)
-        ]
-        logger.info(f"[Crypto/15MinRules] {len(self._rules)} aktive Regeln geladen")
-
-    def evaluate(self, market: dict, context: dict | None = None) -> list[CryptoSignal]:
-        ticker  = market.get("ticker", "")
-        yes_ask = self._price(market, "yes_ask")
-        no_ask  = self._price(market, "no_ask")
-        volume  = float(market.get("volume_24h_fp", 0) or 0)
-        ctx     = context or {}
-
-        for rule in self._rules:
-            act = rule.get("action", {})
-            if act.get("side") != "SKIP":
-                continue
-            cond = rule.get("condition", {})
-            if cond.get("type") == "min_volume_usd":
-                if volume < float(cond.get("threshold", 0)):
-                    return []
-
-        signals: list[CryptoSignal] = []
-        for rule in self._rules:
-            act = rule.get("action", {})
-            if act.get("side") == "SKIP":
-                continue
-            cond_type = rule.get("condition", {}).get("type", "")
-            if cond_type == "btc_15min_spot_convergence":
-                sig = self._eval_spot_convergence(rule, ticker, yes_ask, no_ask, market, ctx)
-            elif cond_type == "btc_15min_mean_reversion":
-                sig = self._eval_mean_reversion(rule, ticker, yes_ask, market, ctx)
-            else:
-                sig = None
-            if sig:
-                signals.append(sig)
-        return signals
-
-    def _eval_spot_convergence(
-        self, rule: dict, ticker: str,
-        yes_ask: Optional[int], no_ask: Optional[int],
-        market: dict, ctx: dict,
-    ) -> Optional[CryptoSignal]:
-        """
-        Spot-Distance Convergence für 15-Min-Märkte.
-
-        Nutzt BingX Spot-Preis vs. Kalshi-Schwelle. Bei großem Abstand
-        zum Settlement-Zeitpunkt ist die in-the-money-Seite fast sicher.
-        """
-        cond = rule.get("condition", {})
-        act  = rule.get("action", {})
-        name = rule.get("name", "15M Spot-Convergence")
-
-        # Threshold aus Ticker (-T Suffix) oder floor_strike (15M-Märkte ohne -T)
-        threshold = self._ticker_threshold(ticker)
-        if threshold <= 0:
-            fs = market.get("floor_strike") or market.get("floor_strike_dollars")
-            threshold = float(fs) if fs else 0.0
-        if threshold <= 0:
-            return None
-
-        # Spot-Preis aus BingX-Kontext
-        spot = ctx.get("btc_price")  # shared key für alle Crypto-Assets
-        if not spot or spot <= 0:
-            return None
-
-        # Restlaufzeit (in Minuten)
-        close_str = market.get("close_time", "")
-        mins_left = self._hours_remaining(close_str) * 60 if close_str else 999.0
-
-        min_mins = float(cond.get("min_mins_remaining", 2.0))
-        max_mins = float(cond.get("max_mins_remaining", 12.0))
-        if mins_left < min_mins or mins_left > max_mins:
-            logger.debug(
-                f"[15M/Spot] {ticker} außerhalb Zeitfenster: {mins_left:.1f}min "
-                f"(erlaubt {min_mins}-{max_mins}min)"
-            )
-            return None
-
-        # Stunden-Blacklist (UTC): bekannte toxische Zeitfenster
-        blocked_hours = cond.get("blocked_hours_utc", [])
-        if blocked_hours:
-            now_hour = datetime.now(timezone.utc).hour
-            if now_hour in blocked_hours:
-                logger.debug(
-                    f"[15M/Spot] {ticker} blockiert: Stunde {now_hour}:00 UTC auf Blacklist"
-                )
-                return None
-
-        # Signierter Abstand: positiv = Spot über Schwelle (YES wahrscheinlich)
-        distance_pct = (spot - threshold) / threshold * 100
-        min_distance_pct = float(cond.get("min_distance_pct", 0.4))
-
-        if abs(distance_pct) < min_distance_pct:
-            logger.info(
-                f"[15M/Spot] {ticker} Abstand {distance_pct:+.2f}% < {min_distance_pct}% Schwelle "
-                f"(spot={spot:.2f} vs thr={threshold:.2f}) – skip"
-            )
-            return None
-
-        # Seite + Preis bestimmen
-        max_yes = int(cond.get("max_yes_price", 88))
-        min_yes = int(cond.get("min_yes_price", 12))
-        offset  = int(act.get("limit_offset_cents", 1))
-
-        if distance_pct > 0:
-            # Spot ist ÜBER Schwelle → YES ist "in-the-money" → kauf YES
-            if yes_ask is None or yes_ask >= max_yes:
-                return None
-            side    = "yes"
-            edge_p  = yes_ask
-            px      = max(1, min(99, yes_ask + offset))
-        else:
-            # Spot ist UNTER Schwelle → NO ist "in-the-money" → kauf NO
-            if no_ask is None or no_ask >= max_yes:
-                return None
-            side    = "no"
-            edge_p  = no_ask
-            px      = max(1, min(99, no_ask + offset))
-
-        # Echte Wahrscheinlichkeit basierend auf Abstand + Zeit
-        # Größerer Abstand + weniger Zeit = höhere Konfidenz
-        abs_dist = abs(distance_pct)
-        if abs_dist >= 1.0:
-            true_p = 0.96
-        elif abs_dist >= 0.7:
-            true_p = 0.92
-        elif abs_dist >= 0.5:
-            true_p = 0.88
-        else:  # 0.4-0.5%
-            true_p = 0.84
-
-        # Zeit-Bonus: bei <5 Min Restlaufzeit ist das Ergebnis fast festgelegt
-        if mins_left <= 3:
-            true_p = min(0.99, true_p + 0.04)
-        elif mins_left <= 5:
-            true_p = min(0.99, true_p + 0.02)
-
-        # Kelly-Sizing
-        bankroll = float(ctx.get("bankroll_usd", 75.0))
-        fraction = float(act.get("kelly_fraction", 0.30))
-        min_cnt  = int(act.get("min_count", 1))
-        max_cnt  = int(act.get("max_count", 10))
-        kelly_c  = kelly_count(px, true_p, bankroll, fraction, min_cnt, max_cnt)
-        if kelly_c == 0:
-            logger.debug(f"[15M/Spot] {ticker} kein Edge bei {edge_p}¢ (true_p={true_p:.2%})")
-            return None
-
-        reason = (
-            f"Spot {spot:,.2f} vs Schwelle {threshold:,.2f} = {distance_pct:+.2f}% | "
-            f"{mins_left:.0f}min verbl. | {side.upper()} @ {edge_p}¢ "
-            f"(P≈{true_p:.0%}) · Kelly={kelly_c}ct"
-        )
-
-        return CryptoSignal(
-            ticker      = ticker,
-            rule_name   = name,
-            side        = side,
-            action      = "buy",
-            price_cents = px,
-            count       = kelly_c,
-            reason      = reason,
-            meta        = {
-                "yes_ask":    yes_ask,
-                "no_ask":     no_ask,
-                "close_time": market.get("close_time", ""),
-                "title":      market.get("title", "")[:80],
-                "spot_price": spot,
-                "threshold":  threshold,
-                "distance_pct": round(distance_pct, 3),
-                "mins_left":  round(mins_left, 1),
-                "system":     SYSTEM,
-            },
-            track       = "crypto_15min",
-        )
-
-    def _eval_mean_reversion(self, rule: dict, ticker: str,
-                              yes_ask: Optional[int], market: dict,
-                              ctx: dict) -> Optional[CryptoSignal]:
-        cond       = rule.get("condition", {})
-        act        = rule.get("action", {})
-        if cond.get("type") != "btc_15min_mean_reversion":
-            return None
-
-        change     = ctx.get("btc_change_15min")
-        rsi        = ctx.get("bingx_rsi")
-        vol_ratio_raw = ctx.get("bingx_vol_ratio")
-        vol_ratio  = float(vol_ratio_raw) if vol_ratio_raw is not None else 1.0
-        if change is None:
-            return None
-
-        bias_thr      = int(float(cond.get("bias_threshold", 0.65)) * 100)
-        change_thr    = float(cond.get("change_threshold_pct", 0.6))
-        rsi_ob        = float(cond.get("rsi_overbought", 72))
-        rsi_os        = float(cond.get("rsi_oversold",   28))
-        vol_ratio_min = float(cond.get("vol_ratio_min",  1.1))
-        count         = int(act.get("count", 5))
-        offset        = int(act.get("limit_offset_cents", 1))
-
-        side, matched, reason = "no", False, ""
-
-        if rsi is not None:
-            if rsi >= rsi_ob and yes_ask is not None and yes_ask >= bias_thr and vol_ratio >= vol_ratio_min:
-                matched = True
-                reason  = f"RSI={rsi:.0f} überkauft / UP={yes_ask}¢ → DOWN fade | Vol={vol_ratio:.2f}"
-                side    = "no"
-            elif rsi <= rsi_os and yes_ask is not None and yes_ask <= (100 - bias_thr) and vol_ratio >= vol_ratio_min:
-                matched = True
-                reason  = f"RSI={rsi:.0f} überverkauft / UP={yes_ask}¢ → UP fade | Vol={vol_ratio:.2f}"
-                side    = "yes"
-            else:
-                logger.debug(
-                    f"[15-Min] {ticker} kein Signal: RSI={rsi:.1f} "
-                    f"(OB≥{rsi_ob}, OS≤{rsi_os}), Vol={vol_ratio:.2f} (min {vol_ratio_min})"
-                )
-        else:
-            if change >= change_thr and yes_ask is not None and yes_ask >= bias_thr:
-                matched = True
-                reason  = f"BTC +{change:.2f}% / UP={yes_ask}¢ → DOWN fade"
-                side    = "no"
-            elif change <= -change_thr and yes_ask is not None and yes_ask <= (100 - bias_thr):
-                matched = True
-                reason  = f"BTC {change:.2f}% / UP={yes_ask}¢ → UP fade"
-                side    = "yes"
-
-        if not matched:
-            return None
-
-        no_ask  = self._price(market, "no_ask")
-        if side == "yes":
-            px = max(1, min(99, (yes_ask or 50) + offset))
-        else:
-            px = max(1, min(99, (no_ask or 50) + offset))
-
-        return CryptoSignal(
-            ticker      = ticker,
-            rule_name   = rule.get("name", "15-Min Mean Reversion"),
-            side        = side,
-            action      = "buy",
-            price_cents = px,
-            count       = count,
-            reason      = reason,
-            meta        = {
-                "yes_ask":    yes_ask,
-                "no_ask":     no_ask,
-                "close_time": market.get("close_time", ""),
-                "title":      market.get("title", "")[:80],
-                "system":     SYSTEM,
-            },
-            track       = "crypto_15min",
-        )
-
-    def _price(self, market: dict, key: str) -> Optional[int]:
-        v = market.get(key + "_dollars") or market.get(key)
-        if v is None:
-            return None
-        try:
-            f = float(v)
-            return int(round(f * 100)) if f <= 1.0 else int(round(f))
-        except (ValueError, TypeError):
-            return None
-
-    def _ticker_threshold(self, ticker: str) -> float:
-        """Parst numerische Schwelle aus Ticker (z.B. KXBTC15M-...-T71500 → 71500.0)."""
-        for sep in ("-T", "-B"):
-            if sep in ticker:
-                try:
-                    return float(ticker.split(sep)[-1])
-                except Exception:
-                    pass
-        return 0.0
-
-    def _hours_remaining(self, close_str: str) -> float:
-        if not close_str:
-            return float("inf")
-        try:
-            ct = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-            return max(0.0, (ct - datetime.now(timezone.utc)).total_seconds() / 3600)
-        except Exception:
-            return float("inf")
+# Crypto15MinRuleEngine ist in crypto/rules_15min.py definiert und oben re-exportiert.

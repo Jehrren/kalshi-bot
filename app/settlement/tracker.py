@@ -17,8 +17,6 @@ Gebühren-Modell (Kalshi-Standard):
 import asyncio
 import json
 import logging
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -212,7 +210,12 @@ class SettlementTracker:
         # Einmal lesen → konsistenter Snapshot für alle Sub-Methoden
         all_trades = self._logger.read_all("TRADE")
         # 1. Exit-P&L verbuchen (Take-Profit / Stop-Loss die bereits ausgeführt wurden)
-        self._process_exits(all_trades)
+        # Lock schützt mark_settled()-Aufrufe in _process_exits gegen concurrent Executor-Zugriffe.
+        if self._risk:
+            async with self._risk.lock:
+                self._process_exits(all_trades)
+        else:
+            self._process_exits(all_trades)
         # 2. Abgelaufene Märkte via API abrechnen
         pending = self._pending_trades(now, all_trades)
         if not pending:
@@ -229,7 +232,18 @@ class SettlementTracker:
                 if result not in ("yes", "no"):
                     logger.debug(f"[Settlement] {ticker} noch nicht settled (result={result!r})")
                     continue
-                self._settle(trade, result)
+                # Lock: _settle() ruft mark_settled() auf – muss atomar mit Executor-Checks sein.
+                # Double-Check inside Lock: zwischen API-Call und Lock kann ein weiterer
+                # Check() oder _process_exits() denselben Ticker abrechnen (race window).
+                if self._risk:
+                    async with self._risk.lock:
+                        if ticker not in self._settled:
+                            self._settle(trade, result)
+                        else:
+                            logger.debug(f"[Settlement] {ticker} bereits settled (race window)")
+                else:
+                    if ticker not in self._settled:
+                        self._settle(trade, result)
             except Exception as e:
                 logger.warning(f"[Settlement] {ticker} API-Fehler: {e}")
 
@@ -262,8 +276,10 @@ class SettlementTracker:
             exit_cnt  = int(ex.get("count", 0))
             if not entry_px or not entry_cnt:
                 continue
-            invested_usd   = round(exit_cnt * entry_px / 100, 4)
-            received_usd   = round(exit_cnt  * exit_px  / 100, 4)
+            # Bei partiellem Exit: nur den tatsächlich geschlossenen Anteil abrechnen
+            settled_cnt    = min(exit_cnt, entry_cnt)
+            invested_usd   = round(settled_cnt * entry_px / 100, 4)
+            received_usd   = round(settled_cnt * exit_px  / 100, 4)
             pnl_usd        = round(received_usd - invested_usd, 4)
             won            = pnl_usd > 0
 
@@ -283,7 +299,7 @@ class SettlementTracker:
 
             self._logger.log_settlement(
                 ticker=ticker, side=entry.get("side", ""),
-                price_cents=entry_px, count=entry_cnt,
+                price_cents=entry_px, count=settled_cnt,
                 result="exit", won=won,
                 invested_usd=invested_usd,
                 gross_return_usd=received_usd,

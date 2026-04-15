@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Datenbanken
+*.db
+
 # Laufzeitdaten
 data/
 app/data/

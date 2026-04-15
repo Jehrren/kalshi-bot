@@ -99,7 +99,7 @@
             "action": {
                 "side": "no", "order_type": "limit", "limit_offset_cents": 1,
                 "kelly_sizing": true, "kelly_fraction": 0.25,
-                "min_count": 1, "max_count": 10
+                "min_count": 1, "max_count": 5
             }
         },
         {
@@ -199,7 +199,7 @@
         },
         {
             "name": "Leiter – YES 85–96% → NO kaufen (Tail-Risiko wird unterschätzt)",
-            "description": "NUR wenn Spot > Schwelle + 2% UND 2–36h verbleibend. threshold_max=96: bei 97¢+ kein ausreichender Edge. max_hours=36: Tages- und morgige Märkte eingeschlossen (intraday <8h haben YES>96¢ blockiert durch threshold_max).",
+            "description": "NUR wenn Spot > Schwelle + 2% UND 2–36h verbleibend. threshold_max=96: bei 97¢+ kein ausreichender Edge. max_count=8: historisch avg=2.9, 15 war zu hoch. Minimum-Preis 12¢ (5-10¢ WR=18% ≈ breakeven, hohe Varianz).",
             "enabled": true,
             "condition": {
                 "type": "yes_ask_above",
@@ -207,12 +207,13 @@
                 "threshold_max": 96,
                 "spot_min_overshoot_pct": 2.0,
                 "min_hours_remaining": 2.0,
-                "max_hours_remaining": 36
+                "max_hours_remaining": 36,
+                "min_no_ask_cents": 12
             },
             "action": {
                 "side": "no", "order_type": "limit", "limit_offset_cents": 1,
                 "kelly_sizing": true, "kelly_fraction": 0.25,
-                "min_count": 1, "max_count": 15
+                "min_count": 1, "max_count": 8
             }
         },
         {
@@ -260,24 +261,24 @@
         },
         {
             "name": "15-Min – Spot-Distance Convergence",
-            "description": "Neue Strategie: BingX Spot-Preis vs. Kalshi-Schwelle. Bei >0.4% Abstand und <12min Restlaufzeit ist die in-the-money-Seite sehr wahrscheinlich korrekt. Gleiches Prinzip wie die Daily Leiter 73-82% Regel (100% WR).",
+            "description": "BingX Spot vs. Kalshi-Schwelle. Kalibriert: true_p gesenkt (96→82%), max_count 10→5, kelly_fraction 0.30→0.20, preis-abhängiger Cap (≥75¢ → max 3). Historisch: TP=100% WR (+$11.64), ZS=0% WR bei hohem Count → Sizing war das Problem.",
             "enabled": true,
             "condition": {
                 "type": "btc_15min_spot_convergence",
-                "min_distance_pct": 0.4,
+                "min_distance_pct": 0.6,
                 "min_mins_remaining": 2.0,
-                "max_mins_remaining": 12.0,
-                "max_yes_price": 88,
-                "min_yes_price": 12,
+                "max_mins_remaining": 10.0,
+                "max_yes_price": 82,
+                "min_yes_price": 15,
                 "blocked_hours_utc": [22, 23]
             },
             "action": {
                 "order_type": "limit",
                 "limit_offset_cents": 1,
                 "kelly_sizing": true,
-                "kelly_fraction": 0.30,
+                "kelly_fraction": 0.20,
                 "min_count": 1,
-                "max_count": 10
+                "max_count": 5
             }
         }
     ],
@@ -363,15 +364,15 @@
         },
         {
             "name": "Ensemble-Edge – Probability-Gap ≥ 15¢",
-            "description": "Kern-Regel: GFS-Ensemble-Probability vs. Marktpreis. Edge mindestens 15¢, hohe Konfidenz nötig.",
+            "description": "Kern-Regel: GFS-Ensemble vs. Marktpreis. YES-Seite im Code deaktiviert (10% WR, -$33). NO-Seite aktiv (57% WR). Confidence 0.3→0.5, max_count 8→5, spread 5→3.5 verschärft.",
             "enabled": true,
             "condition": {
                 "type": "ensemble_edge",
                 "min_edge_cents": 15,
                 "min_hours_remaining": 2.0,
                 "max_hours_remaining": 48,
-                "min_confidence": 0.3,
-                "max_spread_f": 5.0
+                "min_confidence": 0.5,
+                "max_spread_f": 3.5
             },
             "action": {
                 "side": "auto",
@@ -380,8 +381,8 @@
                 "kelly_sizing": true,
                 "kelly_fraction": 0.25,
                 "min_count": 1,
-                "max_count": 8,
-                "max_no_ask_cents": 90
+                "max_count": 5,
+                "max_no_ask_cents": 85
             }
         },
         {

@@ -18,12 +18,13 @@ Regeln (weather_rules):
 """
 
 import logging
-import math
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Optional
 
-from feeds.weather_feed import WeatherFeed, _normal_cdf, CITY_STD_F, _is_summer_month
+from feeds.weather_feed import WeatherFeed
+from utils.kelly import kelly_count
+from utils.market import ticker_threshold, hours_remaining as market_hours_remaining, parse_price_cents
 
 logger = logging.getLogger(__name__)
 
@@ -63,25 +64,7 @@ def weather_corrected_prob(yes_ask_cents: int) -> float:
     return p
 
 
-def kelly_count(price_cents: int, true_prob_win: float,
-                bankroll_usd: float, fraction: float = 0.25,
-                min_count: int = 1, max_count: int = 8,
-                fee_pct: float = 1.0) -> int:
-    """Quarter-Kelly mit Gebühren-Abzug. Gibt 0 zurück wenn kein Edge."""
-    cost = price_cents / 100.0
-    if cost <= 0 or cost >= 1 or true_prob_win <= 0:
-        return min_count
-    fee = fee_pct / 100.0
-    b = (1.0 - cost) * (1.0 - fee) / cost
-    q = 1.0 - true_prob_win
-    f_star = (true_prob_win * b - q) / b
-    if f_star <= 0:
-        return 0
-    if f_star * fraction < 0.01:
-        return 0
-    bet_usd = f_star * fraction * bankroll_usd
-    count = int(bet_usd / cost)
-    return max(min_count, min(max_count, count))
+# kelly_count wird aus utils.kelly importiert (max_count default=8 für Weather-System)
 
 
 class WeatherRuleEngine:
@@ -191,30 +174,44 @@ class WeatherRuleEngine:
             if threshold_val <= 0:
                 return None
 
-            # Ensemble-Probability: P(temp >= threshold)
-            ens_prob = feed.ensemble_probability(threshold_val, market_type)
-            # YES-Ask = Markt-implied P(temp >= threshold) bei "above"-Typ
+            # Guard: Nur echte Ensemble-Daten verwenden (≥5 Mitglieder)
+            n_members = ctx.get("ensemble_members", 0)
+            if n_members < 5:
+                logger.debug(
+                    f"[Weather/Ensemble] {ticker} – nur {n_members} Ensemble-Mitglieder "
+                    f"(< 5), Signal übersprungen"
+                )
+                return None
+
+            # Richtungskorrektur: "<X°"- oder "below"-Kontrakte → YES = P(temp < X)
+            title_text = market.get("title", "").lower()
+            # Robuste Erkennung: explizit "< Zahl" oder "below" im Titel
+            yes_is_below = bool(re.search(r"<\s*\d", title_text) or " below " in title_text)
+
+            # ensemble_probability() gibt immer P(temp >= threshold) zurück
+            # Bei "<"-Kontrakten ist das P(NO), nicht P(YES) → invertieren
+            ens_above_prob = feed.ensemble_probability(threshold_val, market_type)
+            ens_yes_prob = (1.0 - ens_above_prob) if yes_is_below else ens_above_prob
+
             market_yes_p = yes_ask / 100.0
 
             # Edge-Berechnung
-            # Wenn Ensemble sagt "wahrscheinlicher als Markt denkt" → YES kaufen
-            # Wenn Ensemble sagt "unwahrscheinlicher als Markt denkt" → NO kaufen
-            edge_yes = int(round((ens_prob - market_yes_p) * 100))
+            edge_yes = int(round((ens_yes_prob - market_yes_p) * 100))
             edge_no  = -edge_yes
 
             if edge_yes >= min_edge:
-                matched = True
-                side    = "yes"
-                reason  = (
-                    f"Ensemble P={ens_prob:.0%} vs. Markt {yes_ask}¢ | "
-                    f"Edge +{edge_yes}¢ | {city} {threshold_val:.0f}°F | "
-                    f"σ={spread_f:.1f}°F conf={confidence:.2f}"
+                # YES-Seite deaktiviert: 10.3% WR bei 29 Trades, -$33.44 P&L.
+                # Ensemble-Kalibrierung ist systematisch zu optimistisch für YES.
+                # Nur NO-Seite hat Edge (57.1% WR).
+                logger.debug(
+                    f"[Weather/Ensemble] {ticker} YES-Edge +{edge_yes}¢ ignoriert "
+                    f"(YES-Seite deaktiviert – historisch 10% WR)"
                 )
             elif edge_no >= min_edge:
                 matched = True
                 side    = "no"
                 reason  = (
-                    f"Ensemble P(NO)={1-ens_prob:.0%} vs. NO-Ask {no_ask}¢ | "
+                    f"Ensemble P(NO)={1-ens_yes_prob:.0%} vs. NO-Ask {no_ask}¢ | "
                     f"Edge +{edge_no}¢ | {city} {threshold_val:.0f}°F | "
                     f"σ={spread_f:.1f}°F conf={confidence:.2f}"
                 )
@@ -330,11 +327,12 @@ class WeatherRuleEngine:
             # Bei ensemble_edge kennen wir die echte Probability bereits
             if t == "ensemble_edge" and feed is not None and threshold_val > 0:
                 market_type = market.get("_market_type", "high")
-                ens_p = feed.ensemble_probability(threshold_val, market_type)
-                if side == "yes":
-                    true_p = ens_p
-                else:
-                    true_p = 1.0 - ens_p
+                title_text = market.get("title", "").lower()
+                # Konsistente robuste Erkennung (identisch mit Signal-Generierung oben)
+                yes_is_below = bool(re.search(r"<\s*\d", title_text) or " below " in title_text)
+                ens_above_p = feed.ensemble_probability(threshold_val, market_type)
+                ens_yes_p = (1.0 - ens_above_p) if yes_is_below else ens_above_p
+                true_p = ens_yes_p if side == "yes" else (1.0 - ens_yes_p)
             elif side == "no":
                 edge_p = no_ask or px
                 true_p = 1.0 - weather_corrected_prob(100 - edge_p)
@@ -375,29 +373,10 @@ class WeatherRuleEngine:
         )
 
     def _price(self, market: dict, key: str) -> Optional[int]:
-        v = market.get(key + "_dollars") or market.get(key)
-        if v is None:
-            return None
-        try:
-            f = float(v)
-            return int(round(f * 100)) if f <= 1.0 else int(round(f))
-        except (ValueError, TypeError):
-            return None
+        return parse_price_cents(market, key)
 
     def _hours_remaining(self, close_str: str) -> float:
-        if not close_str:
-            return float("inf")
-        try:
-            ct = datetime.fromisoformat(close_str.replace("Z", "+00:00"))
-            return max(0.0, (ct - datetime.now(timezone.utc)).total_seconds() / 3600)
-        except Exception:
-            return float("inf")
+        return market_hours_remaining(close_str)
 
     def _ticker_threshold(self, ticker: str) -> float:
-        for sep in ("-T", "-B"):
-            if sep in ticker:
-                try:
-                    return float(ticker.split(sep)[-1])
-                except Exception:
-                    pass
-        return 0.0
+        return ticker_threshold(ticker)

@@ -146,10 +146,18 @@ class WeatherFeed:
             )
 
     def _fetch(self) -> dict:
+        """
+        Holt stündliche GFS-Ensemble-Daten (31 Member) und aggregiert zu täglichen Max/Min.
+
+        &daily=temperature_2m_max gibt nur den Ensemble-Mittelwert zurück.
+        &hourly=temperature_2m gibt alle Member-Spalten zurück:
+          temperature_2m          (Kontroll-Lauf)
+          temperature_2m_member01 ... temperature_2m_member30
+        """
         params = (
             f"?latitude={self._lat}&longitude={self._lon}"
             f"&models=gfs_seamless"
-            f"&daily=temperature_2m_max,temperature_2m_min"
+            f"&hourly=temperature_2m"
             f"&temperature_unit=fahrenheit"
             f"&timezone=America%2FNew_York"
             f"&forecast_days=2"
@@ -158,10 +166,61 @@ class WeatherFeed:
         try:
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read())
+                raw = json.loads(r.read())
+            return self._build_daily(raw)
         except Exception as e:
             logger.warning(f"[Weather/{self._city}] Fetch fehlgeschlagen: {e}")
             return {}
+
+    def _build_daily(self, raw: dict) -> dict:
+        """
+        Aggregiert stündliche Ensemble-Member-Daten zu täglichen Max/Min.
+
+        Ergebnis-Format entspricht dem _ensemble_highs()/_ensemble_lows() Format:
+          temperature_2m_max            (Kontroll-Lauf tägliches Hoch)
+          temperature_2m_max_member01   (Member 01 tägliches Hoch)
+          ...
+          temperature_2m_min            (Kontroll-Lauf tägliches Tief)
+          temperature_2m_min_member01   (Member 01 tägliches Tief)
+          ...
+        """
+        hourly = raw.get("hourly", {})
+        times = hourly.get("time", [])
+        if not times:
+            logger.warning(f"[Weather/{self._city}] Keine Stundenwerte in API-Antwort")
+            return {}
+
+        daily: dict[str, list] = {"time": []}
+        for day_idx in range(2):
+            start = day_idx * 24
+            end = start + 24
+            if start >= len(times):
+                break
+            daily["time"].append(times[start][:10])
+
+            for key, vals in hourly.items():
+                if not key.startswith("temperature_2m"):
+                    continue
+                day_vals = [v for v in (vals[start:end] or []) if v is not None]
+                if not day_vals:
+                    continue
+                # temperature_2m          → temperature_2m_max / temperature_2m_min
+                # temperature_2m_member01 → temperature_2m_max_member01 / ...
+                suffix = key[len("temperature_2m"):]  # "" oder "_member01"
+                max_key = f"temperature_2m_max{suffix}"
+                min_key = f"temperature_2m_min{suffix}"
+                if max_key not in daily:
+                    daily[max_key] = []
+                    daily[min_key] = []
+                daily[max_key].append(max(day_vals))
+                daily[min_key].append(min(day_vals))
+
+        n_members = sum(1 for k in daily if k.startswith("temperature_2m_max_member"))
+        logger.info(
+            f"[Weather/{self._city}] Ensemble: {n_members + 1} Member "
+            f"(1 Kontroll + {n_members} perturbed)"
+        )
+        return {"daily": daily}
 
     def is_ready(self) -> bool:
         return bool(self._data.get("daily"))

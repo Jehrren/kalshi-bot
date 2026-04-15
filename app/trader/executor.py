@@ -51,11 +51,9 @@ class TradeExecutor:
         self._min_score   = float(p_cfg.get("min_score", 0.30))
         self._max_signals = int(p_cfg.get("max_signals_per_cycle", 10))
 
-        # Lock: macht check_order_allowed + record_order atomar (Dry-Run-Pfad).
-        # Signale werden sequenziell über die Queue verarbeitet (single-consumer).
-        # Lock schützt nur gegen theoretische Interleaving-Szenarien bei zukünftiger
-        # Parallelisierung. Im Live-Pfad wird Lock vor API-Call freigegeben.
-        self._order_lock = asyncio.Lock()
+        # Kein eigener Lock mehr – nutzt risk.lock (gemeinsamer Lock mit SettlementTracker).
+        # Stellt sicher dass check_order_allowed + record_order atomar gegenüber
+        # mark_settled()-Aufrufen aus dem Settlement-Task sind.
         if self._dry_run:
             logger.info("[Executor] *** DRY-RUN MODUS – keine echten Orders ***")
 
@@ -214,7 +212,7 @@ class TradeExecutor:
         system = signal.meta.get("system", "")
 
         # Lock: atomare Sequenz aus check → (record | order+record)
-        async with self._order_lock:
+        async with self._risk.lock:
             self._risk.refresh_positions()
             allowed, reason = self._risk.check_order_allowed(
                 signal.ticker, signal.count, signal.price_cents,
@@ -226,7 +224,7 @@ class TradeExecutor:
                 _expected = ("Bereits positioniert", "Bereits abgerechnet",
                              "Max-Position", "Max-Exposure",
                              "System-Budget", "System-Limit", "Event-Ticker Duplikat",
-                             "Max. offene Positionen")
+                             "Max. offene Positionen", "Einzeltrade-Cap")
                 if not any(reason.startswith(p) for p in _expected):
                     self._logger.log_error("RiskBlock", reason, extra={"ticker": signal.ticker})
                 return
@@ -277,7 +275,24 @@ class TradeExecutor:
                 )
                 return
 
-        # Live-Pfad: Lock vor API-Call freigeben (kann Sekunden dauern)
+        # Live-Pfad: Pending-Reservierung im Lock setzen, damit parallele
+        # Checks denselben Ticker sehen. Bei API-Fehler wird rückgängig gemacht.
+        async with self._risk.lock:
+            self._risk.record_order(
+                signal.ticker, signal.count, signal.price_cents, True,
+                close_time  = signal.meta.get("close_time", ""),
+                side        = signal.side,
+                rule_name   = signal.rule_name,
+                title       = signal.meta.get("title", ""),
+                event_title = signal.meta.get("event_title", ""),
+                reason      = signal.reason,
+                category    = signal.meta.get("category", ""),
+                event_ticker= signal.meta.get("event_ticker", ""),
+                sub_title   = signal.meta.get("sub_title", ""),
+                image_url   = signal.meta.get("image_url", ""),
+                system      = system,
+            )
+
         loop = asyncio.get_running_loop()
         try:
             result = await loop.run_in_executor(
@@ -294,28 +309,19 @@ class TradeExecutor:
         except Exception as e:
             logger.error(f"[Executor] Order fehlgeschlagen {signal.ticker}: {e}")
             self._logger.log_error("OrderFailed", str(e), extra={"ticker": signal.ticker})
+            # Reservierung rückgängig machen
+            async with self._risk.lock:
+                self._risk.record_order(signal.ticker, signal.count, signal.price_cents, False)
             return
 
         order    = result.get("order", {})
         order_id = order.get("id")
         status   = order.get("status", "unknown")
 
-        async with self._order_lock:
-            if status in ("resting", "filled", "partially_filled"):
-                self._risk.record_order(
-                    signal.ticker, signal.count, signal.price_cents, True,
-                    close_time  = signal.meta.get("close_time", ""),
-                    side        = signal.side,
-                    rule_name   = signal.rule_name,
-                    title       = signal.meta.get("title", ""),
-                    event_title = signal.meta.get("event_title", ""),
-                    reason      = signal.reason,
-                    category    = signal.meta.get("category", ""),
-                    event_ticker= signal.meta.get("event_ticker", ""),
-                    sub_title   = signal.meta.get("sub_title", ""),
-                    image_url   = signal.meta.get("image_url", ""),
-                    system      = system,
-                )
+        # Bei Ablehnung durch Exchange: Reservierung rückgängig machen
+        if status not in ("resting", "filled", "partially_filled"):
+            async with self._risk.lock:
+                self._risk.record_order(signal.ticker, signal.count, signal.price_cents, False)
 
         self._logger.log_trade(
             ticker=signal.ticker,

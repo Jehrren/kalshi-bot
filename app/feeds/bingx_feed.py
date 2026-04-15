@@ -197,7 +197,7 @@ class BingXFeed:
         ask_usd = sum(p * q for p, q in asks)
         if ask_usd == 0:
             return None
-        return round(bid_usd / ask_usd, 3)
+        return round(min(bid_usd / ask_usd, 10.0), 3)
 
     def orderbook_walls(self) -> tuple[Optional[float], Optional[float]]:
         """
@@ -237,11 +237,17 @@ class BingXFeed:
             elif ema9 < ema21 * 0.9995:
                 trend = "down"
 
+        spot_change_5min  = self.change_pct(5)
+        spot_change_15min = self.change_pct(15)
         ctx: dict = {
-            # BTC Preis (kompatibel mit altem BTCPriceFeed-Interface)
+            # Asset-agnostische Spot-Preis-Keys (bevorzugt für Multi-Asset-Nutzung)
+            "spot_price":        price,
+            "spot_change_5min":  spot_change_5min,
+            "spot_change_15min": spot_change_15min,
+            # Rückwärts-Kompatibilität mit altem BTCPriceFeed-Interface
             "btc_price":        price,
-            "btc_change_5min":  self.change_pct(5),
-            "btc_change_15min": self.change_pct(15),
+            "btc_change_5min":  spot_change_5min,
+            "btc_change_15min": spot_change_15min,
             # BingX-spezifische Indikatoren
             "bingx_price":     price,
             "bingx_rsi":       rsi_val,
